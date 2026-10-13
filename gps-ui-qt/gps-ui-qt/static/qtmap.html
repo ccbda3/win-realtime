@@ -1,0 +1,2304 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<meta charset="utf-8" />
+<title>GPS Map</title>
+<style>
+    html,body{margin:0;padding:0;height:100%;overflow:hidden;}
+    #map{width:100%;height:100%;min-height:400px}
+    .search-box{position:fixed;top:12px;left:70px;z-index:99999;width:260px;background:transparent}
+    .search-box input{width:100%;padding:8px 14px;border:1px solid #262626;border-radius:8px;background:#0d0d0d;color:#cccccc;font-size:13px;outline:none;box-sizing:border-box}
+    .search-box input:focus{border-color:#818cf8}
+    .search-results{position:fixed;top:52px;left:70px;width:260px;background:#161616;border:1px solid #262626;border-radius:6px;max-height:240px;overflow-y:auto;display:none;z-index:99999}
+    .search-results div{padding:6px 10px;font-size:11px;color:#cccccc;cursor:pointer;border-bottom:1px solid #262626}
+    .search-results div:hover{background:#7c3aed}
+    .search-results div:last-child{border-bottom:none;border-radius:0 0 6px 6px}
+</style>
+<link rel="stylesheet" href="/static/leaflet.css" />
+<script src="/static/leaflet.js"></script>
+<script src="/static/coordtransform.min.js"></script>
+<script>
+    window.MAP_SOURCE = "__MAP_SOURCE__";
+    /* 高德安全 JS 代码（从 C++ 传入），必须在 AMap 脚本加载前设置 */
+    window._AMapSecurityConfig = '__AMAP_SECURITY_CODE__' ? { securityJsCode: '__AMAP_SECURITY_CODE__' } : {};
+</script>
+<script>
+/* 强制页面始终为可见状态，防止 Chromium 在窗口最小化时冻结 JS 定时器 */
+(function(){
+    try {
+        Object.defineProperty(document, 'hidden', { get: function(){ return false; }, configurable: false });
+        Object.defineProperty(document, 'visibilityState', { get: function(){ return 'visible'; }, configurable: false });
+        document.addEventListener('visibilitychange', function(e){ e.stopImmediatePropagation(); }, true);
+    } catch(e) { /* 部分 Chromium 版本可能不允许覆写，忽略 */ }
+})();
+window._amapSwitchCallback = function() {
+    qtLog('AMap 初始加载完成回调');
+    if (typeof AMap !== 'undefined') initMapApi();
+};
+</script>
+<script src="./index.js"></script>
+<script src="./jquery.js"></script>
+</head>
+<body>
+<div id="map"></div>
+<div id="tdtMapContainer" style="position:absolute;left:-9999px;top:-9999px;width:400px;height:300px;overflow:hidden"></div>
+<div class="search-box" id="searchBox"><input id="searchInput" placeholder="搜索地点..." autocomplete="off"><div class="search-results" id="searchResults"></div></div>
+<input type="file" id="jsonPathInput" accept=".json" style="display:none">
+<script>
+var INIT_LAT = 39.906217, INIT_LON = 116.397507, INIT_HGT = 10.0;
+var mapSource = "__MAP_SOURCE__";
+var gpsVersion = "__VERSION_TYPE__";
+window.lat = INIT_LAT;
+window.lon = INIT_LON;
+window.hgt = INIT_HGT;
+var currentMapMode = 'single';
+var currentSpeedKmH = 0;
+var targetSpeedKmH = 0;
+var accelPerTick = 100;
+var g_jitterEnabled = false;
+var jitterRadiusMeters = 2.0;
+
+var d2m = 2 * Math.PI * 6371000 / 360;
+function d2l(a){ return {x:a.lon*d2m,y:a.lat*d2m,z:a.alt}; }
+function l2d(a){ return {lon:a.x/d2m,lat:a.y/d2m,alt:a.z}; }
+function ladd(a,b){ return {x:a.x+b.x,y:a.y+b.y,z:a.z+b.z}; }
+function lsub(a,b){ return {x:a.x-b.x,y:a.y-b.y,z:a.z-b.z}; }
+function lmul(a,b){ return {x:a.x*b,y:a.y*b,z:a.z*b}; }
+function ll(a){ return Math.sqrt(a.x*a.x+a.y*a.y+a.z*a.z); }
+function norm(l){ var lll=ll(l); if (lll < 1e-15) return {x:0,y:0,z:0}; return {x:l.x/lll,y:l.y/lll,z:l.z/lll}; }
+
+var pos = d2l({lon:INIT_LON, lat:INIT_LAT, alt:INIT_HGT});
+var des = pos, vec = {x:0,y:0,z:0};
+
+var rSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="36">'
+    + '<path d="M12 2C7 2, 3 6, 3 11C3 17, 12 36, 12 36S21 17, 21 11C21 6, 17 2, 12 2Z" fill="#ff2020" stroke="#fff" stroke-width="1.5"/>'
+    + '<circle cx="12" cy="10" r="4" fill="#fff"/></svg>';
+var redPinIconData = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(rSvg);
+
+window.mapApi = {};
+var mainMarker = null;
+var previewMarker = null;
+var _tracking = false;
+
+/* 发送日志到 C++ 后端日志面板 */
+function qtLog(msg, tag) {
+    tag = tag || 'MAP';
+    $.post('/log', {msg: msg, tag: tag});
+}
+
+function getEventLng(e) {
+    if (mapSource === "tianditu") return e.latlng.lng;
+    /* BAIDU_BEGIN return e.point.lng; BAIDU_END */
+    if (mapSource === "amap") return e.lnglat.getLng();
+    return e.lnglat ? e.lnglat.getLng() : e.point.lng;
+}
+function getEventLat(e) {
+    if (mapSource === "tianditu") return e.latlng.lat;
+    /* BAIDU_BEGIN return e.point.lat; BAIDU_END */
+    if (mapSource === "amap") return e.lnglat.getLat();
+    return e.lnglat ? e.lnglat.getLat() : e.point.lat;
+}
+function qtSwitchMapSource(newSource, newKey) {
+    if (newSource === mapSource && newKey === window._mapApiKey) return;
+    var savedLat = window.lat, savedLon = window.lon, savedHgt = window.hgt;
+    var savedPathLinear = originalPathLinear.slice();
+    var savedPathMode = pathMode;
+    var savedPathFollowing = pathFollowing;
+    var savedPaused = pausedPathFollowing;
+    var savedCycle = cycleMode;
+    var savedIsClosed = isPathClosed;
+    var savedPathCount = originalPathCount;
+    var savedCurIdx = currentPathIndex;
+    var savedPreview = (window._previewLat !== null && window._previewLon !== null) ?
+        {lat: window._previewLat, lon: window._previewLon} : null;
+    var savedJitterEnabled = g_jitterEnabled;
+    var savedJitterRadius = jitterRadiusMeters;
+    var savedTracking = _tracking;
+
+    clearPath();
+    clearRouteUI();
+    pathMarkers = [];
+    offroadLines = [];
+    window.pathPolyline = null;
+    window.connectionPolyline = null;
+    if (previewMarker) { try{mapApi.removeOverlay(previewMarker);}catch(e){} previewMarker = null; }
+    window._previewLat = null;
+    window._previewLon = null;
+
+    /* 清理旧地图实例 */
+    if (mapApi && mapApi.map) {
+        try {
+            if (typeof mapApi.map.remove === 'function') {
+                mapApi.map.remove(); /* Leaflet（天地图）销毁 */
+            } else if (typeof mapApi.map.destroy === 'function') {
+                mapApi.map.destroy();
+            }
+        } catch(e) { /* ignore */ }
+    }
+    /* 清理天地图 T.Map 服务实例 */
+    if (window._tdtServiceMap) {
+        try { window._tdtServiceMap.clearOverlays(); } catch(e) {}
+        try { window._tdtServiceMap.destroy(); } catch(e) {}
+        window._tdtServiceMap = null;
+    }
+    /* 重建 tdtMapContainer 容器，避免 T.Map 重复初始化失败 */
+    var oldTdtContainer = document.getElementById('tdtMapContainer');
+    if (oldTdtContainer) {
+        var newTdtContainer = document.createElement('div');
+        newTdtContainer.id = 'tdtMapContainer';
+        newTdtContainer.style.cssText = 'position:absolute;left:-9999px;top:-9999px;width:400px;height:300px;overflow:hidden';
+        oldTdtContainer.parentNode.replaceChild(newTdtContainer, oldTdtContainer);
+    }
+
+    var oldMapDiv = document.getElementById('map');
+    if (oldMapDiv) {
+        // Clear all children (BMap canvases, Leaflet panes, etc.)
+        oldMapDiv.innerHTML = '';
+        // Remove and recreate to get a clean DOM element
+        if (oldMapDiv.parentNode) {
+            oldMapDiv.parentNode.removeChild(oldMapDiv);
+        }
+        var newMapDiv = document.createElement('div');
+        newMapDiv.id = 'map';
+        newMapDiv.style.cssText = 'width:100%;height:100%';
+        var searchBox = document.querySelector('.search-box');
+        if (searchBox && searchBox.parentNode) {
+            searchBox.parentNode.insertBefore(newMapDiv, searchBox);
+        } else {
+            document.body.insertBefore(newMapDiv, document.body.firstChild);
+        }
+        // Force reflow so new container has real dimensions
+        newMapDiv.offsetHeight;
+    }
+    mapSource = newSource;
+
+    function doInit() {
+        if (typeof initMapApi !== 'function') { setTimeout(doInit, 100); return; }
+        qtLog('qtSwitchMapSource doInit: newSource=' + newSource + ' savedLat=' + savedLat + ' savedLon=' + savedLon);
+        /* 在调用 initMapApi 之前，把 saved 位置写到 INIT_LON/INIT_LAT
+           这样新地图会直接居中到 saved 位置，而不是默认位置（避免白屏） */
+        if (typeof INIT_LON !== 'undefined') window._origInitLon = INIT_LON;
+        if (typeof INIT_LAT !== 'undefined') window._origInitLat = INIT_LAT;
+        if (savedLat !== undefined && savedLon !== undefined) {
+            window.INIT_LON = savedLon;
+            window.INIT_LAT = savedLat;
+        }
+        initMapApi(newKey);
+        qtLog('qtSwitchMapSource after initMapApi: mapSource=' + mapSource);
+        /* 恢复 INIT_LON/INIT_LAT 避免影响其他地方 */
+        if (window._origInitLon !== undefined) window.INIT_LON = window._origInitLon;
+        if (window._origInitLat !== undefined) window.INIT_LAT = window._origInitLat;
+        /* 强制 Leaflet/百度地图刷新尺寸（修复容器刚重建后白屏） */
+        setTimeout(function(){
+            try {
+                if (newSource === "tianditu" && mapApi && mapApi.map && typeof mapApi.map.invalidateSize === 'function') {
+                    mapApi.map.invalidateSize();
+                    qtLog('Leaflet invalidateSize called');
+                } else if (newSource === "amap" && mapApi && mapApi.map) {
+                    /* BAIDU_BEGIN
+                    else if (newSource === "baidu" && mapApi && mapApi.map) {
+                        var pt = mapApi.wgs84ToDisplay(savedLon, savedLat);
+                        mapApi.centerAndZoom(pt, 15);
+                        qtLog('Baidu recenter: lon=' + savedLon + ' lat=' + savedLat);
+                    }
+                    BAIDU_END */
+                    var pt = mapApi.wgs84ToDisplay(savedLon, savedLat);
+                    mapApi.centerAndZoom(pt, 15);
+                    qtLog('Amap recenter: lon=' + savedLon + ' lat=' + savedLat);
+                }
+            } catch(e) {
+                qtLog('Recenter failed: ' + e.message);
+            }
+        }, 200);
+        window.lat = savedLat; window.lon = savedLon; window.hgt = savedHgt;
+        if (mainMarker && typeof mainMarker.setPosition === 'function' && mapApi && mapApi.map) {
+            var mainPt = mapApi.wgs84ToDisplay(window.lon, window.lat);
+            mainMarker.setPosition(mainPt);
+        }
+        originalPathLinear = savedPathLinear;
+        pathMode = savedPathMode;
+        pathFollowing = savedPathFollowing;
+        pausedPathFollowing = savedPaused;
+        cycleMode = savedCycle;
+        isPathClosed = savedIsClosed;
+        originalPathCount = savedPathCount;
+        currentPathIndex = savedCurIdx;
+        if (originalPathLinear.length > 0) {
+            originalPathBD = originalPathLinear.map(function(p) {
+                var wgs84 = l2d(p);
+                return mapApi.wgs84ToDisplay(wgs84.lon, wgs84.lat);
+            });
+            pathMarkers = [];
+            for (var i = 0; i < originalPathLinear.length; i++) {
+                if (i === 0 || i === originalPathLinear.length - 1 || i === currentPathIndex) {
+                    var wgs84 = l2d(originalPathLinear[i]);
+                    var pt = mapApi.wgs84ToDisplay(wgs84.lon, wgs84.lat);
+                    var marker = mapApi.Marker(pt);
+                    mapApi.addOverlay(marker);
+                    pathMarkers.push(marker);
+                }
+            }
+            drawFullPath();
+            markLastPoint();
+        }
+        if (savedPreview) {
+            window._previewLat = savedPreview.lat;
+            window._previewLon = savedPreview.lon;
+            var prevPt = mapApi.wgs84ToDisplay(savedPreview.lon, savedPreview.lat);
+            showPreview(prevPt, savedPreview.lat, savedPreview.lon);
+            mapApi.centerAndZoom(prevPt, 15);
+        }
+        g_jitterEnabled = savedJitterEnabled;
+        jitterRadiusMeters = savedJitterRadius;
+        _tracking = savedTracking;
+        if (_tracking && window.lat !== undefined) {
+            mapApi.panTo(mapApi.wgs84ToDisplay(window.lon, window.lat));
+        }
+    }
+
+    function waitForLib(cb, tries) {
+        tries = tries || 0;
+        if (tries > 200) { cb(); return; }
+        var ready = false;
+        /* BAIDU_BEGIN
+        if (newSource === "baidu") ready = typeof BMap !== 'undefined' && typeof BMap.Map === 'function';
+        BAIDU_END */
+        if (newSource === "amap") ready = typeof AMap !== 'undefined' && typeof AMap.Map === 'function';
+        else if (newSource === "tianditu") ready = typeof L !== 'undefined' && typeof L.map === 'function' && typeof T !== 'undefined' && typeof T.DrivingRoute === 'function';
+        else ready = true;
+        if (ready) { cb(); return; }
+        setTimeout(function() { waitForLib(cb, tries + 1); }, 50);
+    }
+
+    var needsLoad = false;
+    /* BAIDU_BEGIN
+    if (newSource === "baidu") {
+        if (typeof BMap === 'undefined' || typeof BMap.Map !== 'function') {
+            needsLoad = true;
+        } else {
+            qtLog('BMap 已就绪，稍后初始化');
+            setTimeout(doInit, 200);
+            return;
+        }
+    }
+    BAIDU_END */
+    if (newSource === "amap") {
+        if (typeof AMap === 'undefined' || typeof AMap.Map !== 'function') {
+            needsLoad = true;
+        } else {
+            qtLog('AMap 已就绪，稍后初始化');
+            setTimeout(doInit, 200);
+            return;
+        }
+    }
+    else if (newSource === "tianditu" && (typeof L === 'undefined' || typeof L.map !== 'function' || typeof T === 'undefined' || typeof T.DrivingRoute !== 'function')) { needsLoad = true; }
+
+    if (needsLoad) {
+        /* BAIDU_BEGIN
+        if (newSource === "baidu") {
+            window._baiduSwitchCallback = function() {
+                qtLog('BMap 加载完成回调');
+                setTimeout(doInit, 150);
+            };
+            var s = document.createElement('script');
+            s.src = 'https://api.map.baidu.com/api?v=2.0&ak=' + newKey + '&services=true&callback=_baiduSwitchCallback';
+            document.body.appendChild(s);
+        } else {
+        BAIDU_END */
+        if (newSource === "amap") {
+            window._amapSwitchCallback = function() {
+                qtLog('AMap 加载完成回调');
+                setTimeout(doInit, 150);
+            };
+            var s = document.createElement('script');
+            s.src = 'https://webapi.amap.com/maps?v=2.0&key=' + newKey + '&callback=_amapSwitchCallback';
+            document.body.appendChild(s);
+        } else {
+            /* 天地图：仅加载缺失的库，避免重复加载 Leaflet */
+            if (typeof L === 'undefined' || typeof L.map !== 'function') {
+                var s = document.createElement('script');
+                s.src = '/static/leaflet.js';
+                document.body.appendChild(s);
+            }
+            if (typeof T === 'undefined' || typeof T.DrivingRoute !== 'function') {
+                var s2 = document.createElement('script');
+                s2.src = 'https://api.tianditu.gov.cn/api?v=4.0&tk=' + newKey;
+                document.body.appendChild(s2);
+            }
+        }
+        /* BMap 加载完成后延迟 100ms 确保 API 内部初始化和 DOM 布局完成 */
+        waitForLib(function() { setTimeout(doInit, 100); });
+    } else {
+        /* 库已加载，但 DOM 容器刚重建，等浏览器完成布局后再初始化 */
+        setTimeout(doInit, 100);
+    }
+}
+function qtReloadMap() {
+    location.reload();
+}
+
+function initMapApi(externalApiKey) {
+    var apiKey = externalApiKey || "__API_KEY__";
+    window._mapApiKey = apiKey;
+    /* BAIDU_BEGIN
+    if (mapSource === "baidu") {
+        window._baiduApiKey = apiKey;
+    }
+    BAIDU_END */
+    if (mapSource === "amap") {
+        window._amapApiKey = apiKey;
+    }
+    if (mapSource === "tianditu") {
+        window._tiandituApiKey = apiKey;
+        mapApi.map = L.map("map", { zoomControl: false }).setView([INIT_LAT, INIT_LON], 15);
+        window._tiandituLayers = [];
+        /* 高清瓦片：tileSize=512 + zoomOffset=-1，加载高一级瓦片放大显示 */
+        function tdtTile(url) {
+            return L.tileLayer(url, { maxZoom: 18, tileSize: 512, zoomOffset: -1 });
+        }
+        window._tiandituLayers.push(tdtTile("https://t0.tianditu.gov.cn/DataServer?T=vec_w&x={x}&y={y}&l={z}&tk=" + apiKey).addTo(mapApi.map));
+        window._tiandituLayers.push(tdtTile("https://t0.tianditu.gov.cn/DataServer?T=cva_w&x={x}&y={y}&l={z}&tk=" + apiKey).addTo(mapApi.map));
+        mapApi.map.doubleClickZoom.disable();
+        /* GCJ-02 瓦片 + GCJ-02 坐标，无需转换 */
+        mapApi.wgs84ToDisplay = function(lon, lat) {
+            /* 输入已经是 GCJ-02（从 API 或 window.lon/lat 来），直接返回 */
+            return { lng: lon, lat: lat };
+        };
+        mapApi.displayToWgs84 = function(lng, lat) {
+            return { lon: lng, lat: lat };
+        };
+        mapApi.addOverlay = function(obj) { obj.addTo(mapApi.map); };
+        mapApi.removeOverlay = function(obj) { if (obj) mapApi.map.removeLayer(obj); };
+        mapApi.Marker = function(pt, opts) {
+            var icon = L.icon({
+                iconUrl: redPinIconData,
+                iconSize: [24, 36],
+                iconAnchor: [12, 36]
+            });
+            var m = L.marker([pt.lat, pt.lng], {icon: icon});
+            if (opts && opts.label) m.bindTooltip(opts.label, {permanent:true, offset:[10,-20]});
+            m.setPosition = function(p) { m.setLatLng([p.lat, p.lng]); };
+            return m;
+        };
+        mapApi.Icon = function(url, size) {
+            return L.icon({iconUrl: url, iconSize: [size.width, size.height], iconAnchor: [size.width/2, size.height]});
+        };
+        mapApi.Point = function(lng, lat) { return {lng:lng, lat:lat}; };
+        mapApi.Polyline = function(pts, opts) {
+            var latlngs = pts.map(function(p){ return [p.lat, p.lng]; });
+            return L.polyline(latlngs, {
+                color: opts.strokeColor || "#3388ff",
+                weight: opts.strokeWeight || 3,
+                opacity: opts.strokeOpacity || 0.8,
+                dashArray: opts.strokeStyle === "dashed" ? "10,10" : null
+            });
+        };
+        mapApi.panTo = function(pt) { mapApi.map.panTo([pt.lat, pt.lng]); };
+        mapApi.centerAndZoom = function(pt, z) { mapApi.map.setView([pt.lat, pt.lng], z); };
+        mapApi.setViewport = function(pts) {
+            var latlngs = pts.map(function(p){ return [p.lat, p.lng]; });
+            mapApi.map.fitBounds(latlngs, {padding:[30,30]});
+        };
+        mapApi.lngLatToContainer = function(lnglat) { var p = mapApi.map.latLngToContainerPoint([lnglat[1], lnglat[0]]); return {x: p.x, y: p.y}; };
+        mapApi.Label = function(text, opts) { return text; };
+        mapApi.onClick = function(fn) { mapApi.map.on("click", fn); };
+        mapApi.onDblClick = function(fn) { mapApi.map.on("dblclick", fn); };
+        mapApi.onRightClick = function(fn) { mapApi.map.on("contextmenu", fn); };
+        mapApi.removeEventListener = function(type, fn) { mapApi.map.off(type, fn); };
+        mapApi.setMapType = function(type) {
+            var tk = window._tiandituApiKey || 'c8668a8aaf9e07cf8c21433a9d13ce0a';
+            if (window._tiandituLayers) {
+                window._tiandituLayers.forEach(function(l){ mapApi.map.removeLayer(l); });
+            }
+            window._tiandituLayers = [];
+            var baseTileUrl, annoTileUrl;
+            if (type === 'satellite' || type === 'hybrid') {
+                baseTileUrl = "https://t0.tianditu.gov.cn/DataServer?T=img_w&x={x}&y={y}&l={z}&tk=" + tk;
+                annoTileUrl = "https://t0.tianditu.gov.cn/DataServer?T=cia_w&x={x}&y={y}&l={z}&tk=" + tk;
+            } else {
+                baseTileUrl = "https://t0.tianditu.gov.cn/DataServer?T=vec_w&x={x}&y={y}&l={z}&tk=" + tk;
+                annoTileUrl = "https://t0.tianditu.gov.cn/DataServer?T=cva_w&x={x}&y={y}&l={z}&tk=" + tk;
+            }
+            var tileOpts = { maxZoom: 18, tileSize: 512, zoomOffset: -1 };
+            window._tiandituLayers.push(L.tileLayer(baseTileUrl, tileOpts).addTo(mapApi.map));
+            window._tiandituLayers.push(L.tileLayer(annoTileUrl, tileOpts).addTo(mapApi.map));
+        };
+        /* 创建天地图 T.Map 服务实例（隐藏，仅用于路线规划和搜索） */
+        window._tdtServiceMap = null;
+        if (typeof T !== 'undefined' && typeof T.Map === 'function') {
+            try {
+                window._tdtServiceMap = new T.Map("tdtMapContainer", {mapType: T.DEFAULT_MAP, center: new T.LngLat(116.39, 39.91), zoom: 12});
+            } catch(e) {
+                console.warn('[Tdt] T.Map init failed, using fallback:', e.message);
+                window._tdtServiceMap = null;
+            }
+        }
+        /* 记录是否使用原生 T API 还是 REST API 回退 */
+        window._tdtUseNative = (window._tdtServiceMap !== null);
+    }
+/* BAIDU_BEGIN
+    try {
+        document.body.offsetHeight;
+        var mapDiv = document.getElementById('map');
+        if (mapDiv && mapDiv.offsetHeight === 0) {
+            mapDiv.style.minHeight = '400px';
+        }
+        mapApi.map = new BMap.Map("map");
+        mapApi.map.invalidateSize();
+        qtLog('BMap.Map created OK');
+        setTimeout(function() {
+            try {
+                if (mapApi.map) {
+                    var gcj = coordtransform.wgs84togcj02(INIT_LON, INIT_LAT);
+                    var bd09 = coordtransform.gcj02tobd09(gcj[0], gcj[1]);
+                    mapApi.map.centerAndZoom(new BMap.Point(bd09[0], bd09[1]), 15);
+                    mapApi.map.enableScrollWheelZoom();
+                    mapApi.map.enableDragging();
+                    mapApi.map.disableDoubleClickZoom();
+                    mapApi.map.invalidateSize();
+                }
+            } catch(e) {
+                qtLog('BMap centerAndZoom ERROR: ' + e.message);
+            }
+        }, 300);
+        setTimeout(function() {
+            try {
+                if (mapApi && mapApi.map && typeof mapApi.map.invalidateSize === 'function') {
+                    mapApi.map.invalidateSize();
+                    qtLog('BMap invalidateSize retry OK');
+                }
+            } catch(e) {
+                qtLog('BMap invalidateSize retry ERROR: ' + e.message);
+            }
+        }, 1500);
+    } catch(e) {
+        qtLog('BMap.Map ERROR: ' + e.message);
+        return;
+    }
+    mapApi.wgs84ToDisplay = function(lon, lat) {
+        var gcj = coordtransform.wgs84togcj02(lon, lat);
+        var bd09 = coordtransform.gcj02tobd09(gcj[0], gcj[1]);
+        return new BMap.Point(bd09[0], bd09[1]);
+    };
+    mapApi.displayToWgs84 = function(lng, lat) {
+        var gcj = coordtransform.bd09togcj02(lng, lat);
+        var wgs = coordtransform.gcj02towgs84(gcj[0], gcj[1]);
+        return { lon: wgs[0], lat: wgs[1] };
+    };
+    mapApi.addOverlay = function(obj) { mapApi.map.addOverlay(obj); };
+    mapApi.removeOverlay = function(obj) { if (obj) mapApi.map.removeOverlay(obj); };
+    mapApi.Marker = function(pt, opts) {
+        var m = new BMap.Marker(pt);
+        if (opts && opts.label) m.setLabel(new BMap.Label(opts.label, {offset: new BMap.Size(10,-20)}));
+        return m;
+    };
+    mapApi.Icon = function(url, size) { return new BMap.Icon(url, new BMap.Size(size.width, size.height)); };
+    mapApi.Point = function(lng, lat) { return new BMap.Point(lng, lat); };
+    mapApi.Polyline = function(pts, opts) {
+        return new BMap.Polyline(pts, {
+            strokeColor: opts.strokeColor,
+            strokeWeight: opts.strokeWeight,
+            strokeOpacity: opts.strokeOpacity,
+            strokeStyle: opts.strokeStyle
+        });
+    };
+    mapApi.panTo = function(pt) { mapApi.map.panTo(pt); };
+    mapApi.centerAndZoom = function(pt, z) { mapApi.map.centerAndZoom(pt, z); };
+    mapApi.setViewport = function(pts) { mapApi.map.setViewport(pts); };
+    mapApi.Label = function(text, opts) { return new BMap.Label(text, opts); };
+    mapApi.onClick = function(fn) { mapApi.map.addEventListener("click", fn); };
+    mapApi.onDblClick = function(fn) { mapApi.map.addEventListener("dblclick", fn); };
+    mapApi.onRightClick = function(fn) { mapApi.map.addEventListener("rightclick", fn); };
+    mapApi.removeEventListener = function(type, fn) { mapApi.map.removeEventListener(type, fn); };
+    mapApi.setMapType = function(type) {
+        if (type === 'normal') mapApi.map.setMapType(BMAP_NORMAL_MAP);
+        else if (type === 'satellite') mapApi.map.setMapType(BMAP_SATELLITE_MAP);
+        else if (type === 'hybrid') mapApi.map.setMapType(BMAP_HYBRID_MAP);
+        setTimeout(function() { try { mapApi.map && mapApi.map.invalidateSize && mapApi.map.invalidateSize(); } catch(e) {} }, 100);
+    }
+BAIDU_END */
+    if (mapSource === "amap") {
+        try {
+            document.body.offsetHeight;
+            var mapDiv = document.getElementById('map');
+            if (mapDiv && mapDiv.offsetHeight === 0) {
+                mapDiv.style.minHeight = '400px';
+            }
+            /* 高德地图使用GCJ-02坐标系，center需传入GCJ-02坐标 */
+            var gcjCenter = coordtransform.wgs84togcj02(INIT_LON, INIT_LAT);
+            mapApi.map = new AMap.Map('map', {
+                zoom: 15,
+                center: [gcjCenter[0], gcjCenter[1]],
+                viewMode: '2D',
+                resizeEnable: true,
+                doubleClickZoom: false
+            });
+            qtLog('AMap.Map created OK');
+            /* AMap 使用 GCJ-02 坐标，WGS84→GCJ-02 转换 */
+            mapApi.wgs84ToDisplay = function(lon, lat) {
+                var gcj = coordtransform.wgs84togcj02(lon, lat);
+                return new AMap.LngLat(gcj[0], gcj[1]);
+            };
+            mapApi.gcj02ToDisplay = function(lon, lat) {
+                return new AMap.LngLat(lon, lat);
+            };
+            mapApi.displayToWgs84 = function(lng, lat) {
+                var gcj = coordtransform.gcj02towgs84(lng, lat);
+                return { lon: gcj[0], lat: gcj[1] };
+            };
+            mapApi.lngLatToContainer = function(lnglat) { return mapApi.map.lngLatToContainer(lnglat); };
+            mapApi.addOverlay = function(obj) { mapApi.map.add(obj); };
+            mapApi.removeOverlay = function(obj) { if (obj) mapApi.map.remove(obj); };
+            mapApi.Marker = function(pt, opts) {
+                var m = new AMap.Marker({position: pt});
+                if (opts && opts.label) m.setLabel({content: opts.label, offset: new AMap.Pixel(10,-20)});
+                return m;
+            };
+            mapApi.Icon = function(url, size) { return new AMap.Icon({image: url, size: new AMap.Size(size.width, size.height), imageSize: new AMap.Size(size.width, size.height)}); };
+            mapApi.Point = function(lng, lat) { return new AMap.LngLat(lng, lat); };
+            mapApi.Polyline = function(pts, opts) {
+                var path = pts.map(function(p){ return [p.lng, p.lat]; });
+                return new AMap.Polyline({path: path, strokeColor: opts.strokeColor, strokeWeight: opts.strokeWeight, strokeOpacity: opts.strokeOpacity, strokeStyle: opts.strokeStyle === 'dashed' ? 'dashed' : 'solid'});
+            };
+            mapApi.panTo = function(pt) { mapApi.map.setCenter(pt); };
+            mapApi.centerAndZoom = function(pt, z) { mapApi.map.setZoomAndCenter(z, pt); };
+            mapApi.setViewport = function(pts) {
+                var minLng = pts[0].lng, maxLng = pts[0].lng, minLat = pts[0].lat, maxLat = pts[0].lat;
+                for (var i = 1; i < pts.length; i++) {
+                    if (pts[i].lng < minLng) minLng = pts[i].lng;
+                    if (pts[i].lng > maxLng) maxLng = pts[i].lng;
+                    if (pts[i].lat < minLat) minLat = pts[i].lat;
+                    if (pts[i].lat > maxLat) maxLat = pts[i].lat;
+                }
+                mapApi.map.setBounds(new AMap.Bounds(
+                    new AMap.LngLat(minLng, minLat),
+                    new AMap.LngLat(maxLng, maxLat)
+                ));
+            };
+            mapApi.Label = function(text, opts) { return text; };
+            mapApi.onClick = function(fn) { mapApi.map.on('click', fn); };
+            mapApi.onDblClick = function(fn) { mapApi.map.on('dblclick', fn); };
+            mapApi.onRightClick = function(fn) { mapApi.map.on('rightclick', fn); };
+            mapApi.removeEventListener = function(type, fn) { mapApi.map.off(type, fn); };
+            mapApi.setMapType = function(type) {
+                /* 清除之前的自定义图层 */
+                if (window._amapExtraLayers) {
+                    window._amapExtraLayers.forEach(function(l){ mapApi.map.remove(l); });
+                }
+                window._amapExtraLayers = [];
+                /* 恢复默认样式 */
+                mapApi.map.setMapStyle('amap://styles/normal');
+                if (type === 'satellite') {
+                    var sat = new AMap.TileLayer.Satellite();
+                    mapApi.map.add(sat);
+                    window._amapExtraLayers.push(sat);
+                } else if (type === 'hybrid') {
+                    var sat2 = new AMap.TileLayer.Satellite();
+                    var road = new AMap.TileLayer.RoadNet();
+                    mapApi.map.add(sat2);
+                    mapApi.map.add(road);
+                    window._amapExtraLayers.push(sat2);
+                    window._amapExtraLayers.push(road);
+                }
+            };
+            mapApi.map.on('complete', function(){
+                qtLog('AMap load complete');
+                /* 加载高德插件：路线规划、搜索、自动补全 */
+                if (typeof AMap.plugin === 'function') {
+                    AMap.plugin(['AMap.Driving', 'AMap.Autocomplete', 'AMap.PlaceSearch'], function(){
+                        qtLog('AMap plugins loaded');
+                    });
+                }
+            });
+        } catch(e) {
+            qtLog('AMap.Map ERROR: ' + e.message);
+            return;
+        }
+    }
+
+    mainMarker = mapApi.Marker(mapApi.wgs84ToDisplay(INIT_LON, INIT_LAT));
+    if (mainMarker.setIcon) {
+        mainMarker.setIcon(mapApi.Icon(redPinIconData, {width:24, height:36}));
+    }
+    mapApi.addOverlay(mainMarker);
+
+    mapApi.onDblClick(function(e){
+        if(currentMapMode !== 'single') return;
+        var wgs = mapApi.displayToWgs84(
+            getEventLng(e),
+            getEventLat(e)
+        );
+        window._previewLat = wgs.lat; window._previewLon = wgs.lon;
+        var displayPt = mapApi.wgs84ToDisplay(wgs.lon, wgs.lat);
+        showPreview(displayPt, wgs.lat, wgs.lon);
+        console.log('SINGLE_PREVIEW:' + wgs.lat.toFixed(7) + ',' + wgs.lon.toFixed(7));
+    });
+
+    mapApi.onClick(function(e){
+        if(currentMapMode === 'custom'){
+            var wgs = mapApi.displayToWgs84(
+                getEventLng(e),
+                getEventLat(e)
+            );
+            var displayPt = mapApi.wgs84ToDisplay(wgs.lon, wgs.lat);
+            /* 点击添加路径点时清除残留预览标记 */
+            if(previewMarker){
+                mapApi.removeOverlay(previewMarker);
+                previewMarker = null;
+                window._previewLat = null; window._previewLon = null;
+            }
+            addPathPoint(displayPt);
+        } else if(currentMapMode === 'route'){
+            /* route 点击处理直接放在主 handler，无需独立 routeClickHandler */
+            clearRouteUI();
+            var clickLng = getEventLng(e);
+            var clickLat = getEventLat(e);
+            var wgs = mapApi.displayToWgs84(clickLng, clickLat);
+            var startPt = mapApi.wgs84ToDisplay(window.lon, window.lat);
+            routeStartPt = startPt;
+            routeStartMarker = mapApi.Marker(startPt, {label: "起点"});
+            mapApi.addOverlay(routeStartMarker);
+            routeEndPt = mapApi.Point(clickLng, clickLat);
+            routeEndMarker = mapApi.Marker(routeEndPt, {label: "终点"});
+            mapApi.addOverlay(routeEndMarker);
+            routeClickState = 1;
+            /* BAIDU_BEGIN
+            if (mapSource !== "baidu") {
+                try { console.log("ROUTE_TARGET:" + wgs.lat.toFixed(7) + "," + wgs.lon.toFixed(7)); } catch(e) {}
+            } else {
+                calculateRoute(routeStartPt, routeEndPt);
+            }
+            BAIDU_END */
+            if (mapSource === "tianditu" || mapSource === "amap") {
+                try { console.log("ROUTE_TARGET:" + wgs.lat.toFixed(7) + "," + wgs.lon.toFixed(7)); } catch(e) {}
+            } else {
+                calculateRoute(routeStartPt, routeEndPt);
+            }
+        }
+    });
+
+    mapApi.onRightClick(function(e){
+        if(currentMapMode === 'custom') qtUndoPathPoint();
+    });
+}
+
+/* BAIDU_BEGIN
+if (mapSource === "baidu") {
+    if (typeof BMap !== 'undefined') {
+        initMapApi();
+    } else {
+        var baiduScript = document.createElement('script');
+        baiduScript.src = 'https://api.map.baidu.com/api?v=2.0&ak=__API_KEY__&services=true&callback=initMapApi';
+        document.body.appendChild(baiduScript);
+    }
+} else {
+    if (typeof L !== 'undefined') {
+        if (mapSource === "tianditu") {
+            var tdtScript = document.createElement('script');
+            tdtScript.src = 'https://api.tianditu.gov.cn/api?v=4.0&tk=__API_KEY__';
+            tdtScript.onload = function() { initMapApi(); };
+            document.body.appendChild(tdtScript);
+        } else {
+            initMapApi();
+        }
+    } else {
+        var leafletTries = 0;
+        var leafletReady = setInterval(function() {
+            leafletTries++;
+            if (leafletTries > 200) { clearInterval(leafletReady); return; }
+            if (typeof L !== 'undefined') {
+                clearInterval(leafletReady);
+                if (mapSource === "tianditu") {
+                    var tdtScript = document.createElement('script');
+                    tdtScript.src = 'https://api.tianditu.gov.cn/api?v=4.0&tk=__API_KEY__';
+                    tdtScript.onload = function() { initMapApi(); };
+                    document.body.appendChild(tdtScript);
+                } else {
+                    initMapApi();
+                }
+            }
+        }, 50);
+    }
+}
+BAIDU_END */
+if (mapSource === "amap") {
+    if (typeof AMap !== 'undefined' && typeof AMap.Map === 'function') {
+        initMapApi();
+    } else {
+        /* 尝试加载高德 JS API */
+        var amapScript = document.createElement('script');
+        amapScript.src = 'https://webapi.amap.com/maps?v=2.0&key=__API_KEY__&callback=_amapSwitchCallback';
+        amapScript.onerror = function() {
+            qtLog('高德地图脚本加载失败，5秒后重试');
+            setTimeout(function() {
+                /* 重试使用 onload 方式 */
+                var s2 = document.createElement('script');
+                s2.src = 'https://webapi.amap.com/maps?v=2.0&key=__API_KEY__';
+                s2.onload = function() { setTimeout(function(){
+                    if (typeof AMap !== 'undefined') { initMapApi(); }
+                    else { qtLog('高德地图加载失败，请检查网络和Key'); }
+                }, 500); };
+                document.body.appendChild(s2);
+            }, 5000);
+        };
+        document.body.appendChild(amapScript);
+        /* 10秒超时兜底 */
+        window._amapLoadTimer = setTimeout(function() {
+            if (typeof AMap === 'undefined' || typeof AMap.Map !== 'function') {
+                qtLog('高德地图加载超时，尝试重新加载');
+                var s3 = document.createElement('script');
+                s3.src = 'https://webapi.amap.com/maps?v=2.0&key=__API_KEY__';
+                s3.onload = function() {
+                    if (typeof AMap !== 'undefined') { initMapApi(); }
+                };
+                document.body.appendChild(s3);
+            }
+        }, 10000);
+    }
+} else if (mapSource === "tianditu") {
+    if (typeof L !== 'undefined') {
+        var tdtScript = document.createElement('script');
+        tdtScript.src = 'https://api.tianditu.gov.cn/api?v=4.0&tk=__API_KEY__';
+        tdtScript.onload = function() { initMapApi(); };
+        document.body.appendChild(tdtScript);
+    } else {
+        var leafletTries = 0;
+        var leafletReady = setInterval(function() {
+            leafletTries++;
+            if (leafletTries > 200) { clearInterval(leafletReady); return; }
+            if (typeof L !== 'undefined') {
+                clearInterval(leafletReady);
+                var tdtScript = document.createElement('script');
+                tdtScript.src = 'https://api.tianditu.gov.cn/api?v=4.0&tk=__API_KEY__';
+                tdtScript.onload = function() { initMapApi(); };
+                document.body.appendChild(tdtScript);
+            }
+        }, 50);
+    }
+} else {
+    initMapApi();
+}
+
+if (!mainMarker) {
+    mainMarker = { setPosition: function(pt) {}, setIcon: function() {} };
+}
+
+var map = mapApi.map || {};
+
+function svgDataUrl(color, size){
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="'+size+'" height="'+size+'">'
+            + '<circle cx="'+(size/2)+'" cy="'+(size/2)+'" r="'+(size/2-1)+'" fill="'+color+'" stroke="#fff" stroke-width="2"/>'
+            + '</svg>';
+    return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+}
+
+function showPreview(ptDisplay, lat, lng){
+    if (previewMarker) {
+        mapApi.removeOverlay(previewMarker);
+        previewMarker = null;
+    }
+    previewMarker = mapApi.Marker(ptDisplay, {label: "预览坐标"});
+    mapApi.addOverlay(previewMarker);
+}
+
+function qtConfirmSinglePos(){
+    if(!window._previewLat) return;
+    var newPos = d2l({lon:window._previewLon, lat:window._previewLat, alt:window.hgt});
+    window.lon = window._previewLon; window.lat = window._previewLat;
+    window._jitBaseLat = window.lat;
+    window._jitBaseLon = window.lon;
+    if(_jitDrift){ _jitDrift.ox = 0; _jitDrift.oy = 0; _jitDrift.tx = 0; _jitDrift.ty = 0; }
+    pos = newPos; des = newPos; vec = {x:0,y:0,z:0};
+    var pt = mapApi.wgs84ToDisplay(window._previewLon, window._previewLat);
+    mainMarker.setPosition(pt);
+    if(previewMarker){
+        mapApi.removeOverlay(previewMarker);
+        previewMarker = null;
+    }
+}
+
+function qtShowPreview(lat, lng){
+    window._previewLat = lat;
+    window._previewLon = lng;
+    var pt = mapApi.wgs84ToDisplay(lng, lat);
+    showPreview(pt, lat, lng);
+}
+
+function qtCancelPreview(){
+    if(previewMarker){
+        mapApi.removeOverlay(previewMarker);
+        previewMarker = null;
+    }
+    window._previewLat = null; window._previewLon = null;
+}
+
+// ===== 全新搜索系统 =====
+var searchTimer = null;
+var searchInput = document.getElementById('searchInput');
+var searchResults = document.getElementById('searchResults');
+var searchData = [];
+
+function flyToPlace(name, lat, lng, isGcj02){
+    window._previewLat = lat;
+    window._previewLon = lng;
+    var pt = isGcj02 && mapApi.gcj02ToDisplay ? mapApi.gcj02ToDisplay(lng, lat) : mapApi.wgs84ToDisplay(lng, lat);
+    showPreview(pt, lat, lng);
+    mapApi.centerAndZoom(pt, 15);
+    searchResults.style.display = 'none';
+    searchInput.blur();
+}
+
+/* 显示搜索下拉列表 */
+function showSearchResults(items) {
+    searchResults.innerHTML = '';
+    searchData = [];
+    if (!items || items.length === 0) {
+        searchResults.style.display = 'none';
+        qtLog('搜索: 无结果显示');
+        return;
+    }
+    for (var i = 0; i < Math.min(items.length, 20); i++) {
+        var item = items[i];
+        searchData.push({name: item.name, lat: item.lat, lng: item.lng, _isAmap: item._isAmap});
+        var div = document.createElement('div');
+        div.textContent = item.name + (item.address ? ' - ' + item.address : '');
+        div.style.cssText = 'padding:8px 12px;font-size:13px;color:#cccccc;cursor:pointer;border-bottom:1px solid #262626';
+        div.onmouseover = function(){ this.style.background = '#7c3aed'; };
+        div.onmouseout = function(){ this.style.background = ''; };
+        div.onclick = (function(idx) { return function() {
+             var d = searchData[idx];
+             flyToPlace(d.name, d.lat, d.lng, d._isAmap);
+         }; })(i);
+        searchResults.appendChild(div);
+    }
+    searchResults.style.display = 'block';
+    qtLog('搜索: 显示 ' + items.length + ' 条结果');
+}
+
+/* 天地图搜索：仅使用 REST API（跳过不可靠的原生 T.LocalSearch） */
+function tiandituSearch(keyword) {
+    qtLog('天地图搜索: ' + keyword);
+    var tk = window._tiandituApiKey || 'c8668a8aaf9e07cf8c21433a9d13ce0a';
+    if (!tk) { qtLog('天地图搜索: Key 未设置'); return; }
+    var postStr = JSON.stringify({
+        keyWord: keyword,
+        mapBound: '73.0,3.0,135.0,54.0',
+        level: 12,
+        queryType: 1,
+        start: 0,
+        count: 20
+    });
+    var url = 'https://api.tianditu.gov.cn/v2/search?postStr=' + encodeURIComponent(postStr) + '&type=query&tk=' + tk;
+    qtLog('天地图REST请求: ' + keyword);
+    $.getJSON(url, function(data) {
+        if (!data || !data.status || data.status.infocode !== 1000) {
+            qtLog('天地图REST失败: ' + JSON.stringify(data && data.status));
+            searchResults.style.display = 'none';
+            return;
+        }
+        var pois = data.pois || [];
+        var items = [];
+        for (var i = 0; i < pois.length; i++) {
+            var p = pois[i];
+            if (p.lonlat) {
+                var ll = p.lonlat.split(',');
+                if (ll.length >= 2) {
+                    items.push({
+                        name: p.name || '',
+                        lat: parseFloat(ll[1]),
+                        lng: parseFloat(ll[0]),
+                        address: p.address || ''
+                    });
+                }
+            }
+        }
+        /* 如果有行政区结果（无POI），也加入 */
+        if (items.length === 0 && data.area && data.area.lonlat) {
+            var ll = data.area.lonlat.split(',');
+            if (ll.length >= 2) {
+                items.push({
+                    name: data.area.name || keyword,
+                    lat: parseFloat(ll[1]),
+                    lng: parseFloat(ll[0]),
+                    address: '(行政区)'
+                });
+            }
+        }
+        qtLog('天地图结果: ' + items.length + ' 条');
+        showSearchResults(items);
+    }).fail(function(xhr, status, err) {
+        qtLog('天地图REST异常: ' + status + ' ' + err);
+    });
+}
+
+/* 高德搜索 */
+function amapSearch(keyword) {
+    qtLog('高德搜索: ' + keyword);
+    if (typeof AMap === 'undefined') { qtLog('高德搜索: AMap 未加载'); return; }
+    /* 确保插件已加载 */
+    if (typeof AMap.Autocomplete !== 'function' || typeof AMap.PlaceSearch !== 'function') {
+        if (typeof AMap.plugin === 'function') {
+            AMap.plugin(['AMap.Autocomplete', 'AMap.PlaceSearch'], function() {
+                doAmapSearch(keyword);
+            });
+        } else { qtLog('高德搜索: AMap.plugin 不可用'); }
+        return;
+    }
+    doAmapSearch(keyword);
+}
+function doAmapSearch(keyword) {
+    qtLog('高德搜索SDK: ' + keyword);
+    if (typeof AMap === 'undefined' || typeof AMap.PlaceSearch !== 'function') {
+        qtLog('高德搜索SDK: PlaceSearch 不可用');
+        return;
+    }
+    var ps = new AMap.PlaceSearch({ pageSize: 15, pageIndex: 1 });
+    ps.search(keyword, function(status, result) {
+        qtLog('高德搜索SDK回调: status=' + status);
+        if (status !== 'complete' || !result.poiList || !result.poiList.pois || result.poiList.pois.length === 0) {
+            qtLog('高德搜索SDK: 无结果');
+            searchResults.style.display = 'none';
+            return;
+        }
+        var items = [];
+        for (var i = 0; i < Math.min(result.poiList.pois.length, 15); i++) {
+            var p = result.poiList.pois[i];
+            if (p.location) {
+                items.push({name: p.name || '', lat: p.location.lat, lng: p.location.lng, address: p.address || '', _isAmap: true});
+            }
+        }
+        qtLog('高德搜索SDK: ' + items.length + ' 条结果');
+        showSearchResults(items);
+    });
+}
+
+/* 搜索输入事件 */
+searchInput.addEventListener('input', function() {
+    var q = this.value.trim();
+    if (q.length < 1) { searchResults.style.display = 'none'; return; }
+    if (searchTimer) clearTimeout(searchTimer);
+    searchTimer = setTimeout(function() {
+        qtLog('搜索关键字: "' + q + '" 地图=' + mapSource);
+        if (mapSource === "amap") { amapSearch(q); }
+        else { tiandituSearch(q); }
+    }, 200);
+});
+
+/* 点击外部关闭下拉 */
+document.addEventListener('click', function(e) {
+    if (!searchInput.contains(e.target) && !searchResults.contains(e.target))
+        searchResults.style.display = 'none';
+});
+
+var searchMarkers = [];
+function qtUpdatePos(lat, lng, hgt) {
+    var newPos = d2l({lon:lng, lat:lat, alt:hgt});
+    window.lat = lat; window.lon = lng; window.hgt = hgt;
+    pos = newPos;
+    if (!pathFollowing) des = newPos;
+    var pt = mapApi.wgs84ToDisplay(lng, lat);
+    mainMarker.setPosition(pt);
+    if (_tracking) {
+        mapApi.panTo(pt);
+    }
+}
+
+function qtSetTracking(on) {
+    _tracking = on;
+    if (on && window.lat !== undefined) {
+        var pt = mapApi.wgs84ToDisplay(window.lon, window.lat);
+        mapApi.panTo(pt);
+    }
+}
+
+function qtTrackingPan(lat, lng) {
+    if (!_tracking) return;
+    var pt = mapApi.wgs84ToDisplay(lng, lat);
+    mapApi.panTo(pt);
+}
+
+function qtAddMarker(lat, lng, label) {
+    var pt = mapApi.wgs84ToDisplay(lng, lat);
+    var m = mapApi.Marker(pt, label ? {label: label} : undefined);
+    mapApi.addOverlay(m);
+}
+
+function qtMapType(type) {
+    mapApi.setMapType(type);
+}
+
+function qtSetHeight(val) { window.hgt = val; }
+function qtSetSpeed(kmh) {
+    targetSpeedKmH = kmh;
+    qtLog("Speed set: target=" + targetSpeedKmH + " current=" + currentSpeedKmH +
+          " pathFollowing=" + pathFollowing + " paused=" + pausedPathFollowing +
+          " pathLen=" + originalPathLinear.length);
+    qtSyncCpp();
+}
+
+/* 将路径数据同步到 C++ 位置引擎，确保 WebEngine 冻结时 GPS 发射不中断 */
+function qtSyncCpp() {
+    var data = JSON.stringify({
+        pts: originalPathLinear,
+        idx: currentPathIndex,
+        pf: pathFollowing,
+        pp: pausedPathFollowing,
+        pc: pathCompleted,
+        cyc: cycleMode,
+        cx: pos.x, cy: pos.y, cz: pos.z,
+        tx: des.x, ty: des.y, tz: des.z,
+        cs: currentSpeedKmH,
+        ts: targetSpeedKmH
+    });
+    $.post("/cpppath", "points=" + encodeURIComponent(data));
+}
+
+var pathMode = false;
+var originalPathBD = [];
+var originalPathLinear = [];
+var routeOriginalPts = [];
+var isRouteFromPlanning = false;
+
+/* 在投影坐标空间中找到 pos 在路径上的位置比例 t，用 t 在显示坐标空间插值出图钉位置 */
+/* 返回 {lon, lat, distMeters}，distMeters < 0 表示不在路径附近 */
+function getDisplayPosition(pos, linearPath, displayPath) {
+    if (!linearPath || linearPath.length < 2 || !displayPath || displayPath.length < 2) return null;
+    var bestSeg = 0, bestT = 0;
+    var minD2 = Infinity;
+    for (var i = 0; i < linearPath.length - 1; i++) {
+        var a = linearPath[i], b = linearPath[i+1];
+        var dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+        var len2 = dx*dx + dy*dy + dz*dz;
+        if (len2 < 1e-16) continue;
+        var t = ((pos.x - a.x)*dx + (pos.y - a.y)*dy + (pos.z - a.z)*dz) / len2;
+        if (t < 0) t = 0;
+        if (t > 1) t = 1;
+        var px = a.x + t*dx, py = a.y + t*dy;
+        var d2 = (pos.x-px)*(pos.x-px) + (pos.y-py)*(pos.y-py);
+        if (d2 < minD2) { minD2 = d2; bestSeg = i; bestT = t; }
+    }
+    function coords(p) {
+        if (p.lng !== undefined) return {lon: p.lng, lat: p.lat};
+        if (typeof p.getLng === 'function') return {lon: p.getLng(), lat: p.getLat()};
+        return {lon: p.lon || 0, lat: p.lat || 0};
+    }
+    var da = coords(displayPath[bestSeg]);
+    var db = coords(displayPath[bestSeg + 1]);
+    return {
+        lon: da.lon + (db.lon - da.lon) * bestT,
+        lat: da.lat + (db.lat - da.lat) * bestT,
+        distMeters: Math.sqrt(minD2)
+    };
+}
+var pathMarkers = [];
+var pathFollowing = false;
+var pausedPathFollowing = false;
+var cycleMode = false;
+var pathCompleted = false;
+var currentPathIndex = 0;
+var isPathClosed = false;
+var originalPathCount = 0;
+var txtTimestamps = [];
+var txtHeights = [];
+var txtSpeeds = [];
+var offroadLines = [];
+var useTxtSpeed = false;
+
+function getBDPointDistance(p1, p2){
+    var l1 = d2l({lon:p1.lng, lat:p1.lat, alt:0});
+    var l2 = d2l({lon:p2.lng, lat:p2.lat, alt:0});
+    return ll(lsub(l1, l2));
+}
+
+function drawFullPath(){
+    try{
+        if(window.pathPolyline) {
+            mapApi.removeOverlay(window.pathPolyline);
+        }
+        if(window.connectionPolyline) {
+            mapApi.removeOverlay(window.connectionPolyline);
+        }
+        if(originalPathBD.length >= 2){
+            if(isPathClosed && originalPathCount > 0 && originalPathCount < originalPathBD.length){
+                var originalPath = originalPathBD.slice(0, originalPathCount);
+                if(originalPath.length >= 2){
+                    window.pathPolyline = mapApi.Polyline(originalPath, {strokeColor:"blue", strokeWeight:3, strokeOpacity:0.6});
+                    mapApi.addOverlay(window.pathPolyline);
+                }
+                var connectionPath = originalPathBD.slice(originalPathCount - 1);
+                if(connectionPath.length >= 2){
+                    window.connectionPolyline = mapApi.Polyline(connectionPath, {strokeColor:"#00ff00", strokeWeight:3, strokeOpacity:0.8});
+                    mapApi.addOverlay(window.connectionPolyline);
+                }
+            } else {
+                window.pathPolyline = mapApi.Polyline(originalPathBD, {strokeColor:"blue", strokeWeight:3, strokeOpacity:0.6});
+                mapApi.addOverlay(window.pathPolyline);
+            }
+        }
+    }catch(e){console.warn('drawFullPath failed',e);}
+}
+
+function markLastPoint(){
+    var smallUrl = svgDataUrl('#d33', 14);
+    var bigUrl = svgDataUrl('#e53935', 20);
+    for(var i=0;i<pathMarkers.length;i++){
+        try{
+            var isTarget = cycleMode ? (i === currentPathIndex) : (i === pathMarkers.length-1);
+            pathMarkers[i].setIcon(mapApi.Icon(isTarget ? bigUrl : smallUrl, {width: isTarget?20:14, height: isTarget?20:14}));
+        }catch(e){}
+    }
+}
+
+function rebuildPathDisplay() {
+    if (originalPathLinear.length === 0) return;
+    originalPathBD = originalPathLinear.map(function(p) {
+        var wgs84 = l2d(p);
+        return mapApi.wgs84ToDisplay(wgs84.lon, wgs84.lat);
+    });
+    pathMarkers.forEach(function(m){ mapApi.removeOverlay(m); });
+    pathMarkers = [];
+    for (var i = 0; i < originalPathLinear.length; i++) {
+        if (i === 0 || i === originalPathLinear.length - 1 || i === currentPathIndex) {
+            var wgs84 = l2d(originalPathLinear[i]);
+            var pt = mapApi.wgs84ToDisplay(wgs84.lon, wgs84.lat);
+            var marker = mapApi.Marker(pt);
+            mapApi.addOverlay(marker);
+            pathMarkers.push(marker);
+        }
+    }
+    drawFullPath();
+    markLastPoint();
+}
+
+function truncateEntryPath(closePointIndex){
+    originalPathBD = originalPathBD.slice(closePointIndex);
+    originalPathLinear = originalPathLinear.slice(closePointIndex);
+    pathMarkers.slice(0, closePointIndex).forEach(function(m){
+        mapApi.removeOverlay(m);
+    });
+    pathMarkers = pathMarkers.slice(closePointIndex);
+    isPathClosed = true;
+    drawFullPath();
+    markLastPoint();
+}
+
+function addPathPoint(bdPoint){
+    if(originalPathBD.length === 0){
+        var wgs84 = {lon: l2d(pos).lon, lat: l2d(pos).lat};
+        var startDisplay = mapApi.wgs84ToDisplay(wgs84.lon, wgs84.lat);
+        var startPt = mapApi.Point(startDisplay.lng, startDisplay.lat);
+        originalPathBD.push(startPt);
+        originalPathLinear.push(d2l({lon:wgs84.lon, lat:wgs84.lat, alt:20}));
+        var startMarker = mapApi.Marker(startPt);
+        mapApi.addOverlay(startMarker);
+        pathMarkers.push(startMarker);
+    }
+
+    var closeThreshold = 5;
+    var closePointIndex = -1;
+    for(var i=0; i<originalPathBD.length; i++){
+        var dist = getBDPointDistance(bdPoint, originalPathBD[i]);
+        if(dist < closeThreshold){ closePointIndex = i; break; }
+    }
+
+    if(closePointIndex === 0 && !isPathClosed){
+        originalPathBD.push(bdPoint);
+        var wgsDisp = mapApi.displayToWgs84(bdPoint.lng, bdPoint.lat);
+        originalPathLinear.push(d2l({lon:wgsDisp.lon, lat:wgsDisp.lat, alt:20}));
+        var m = mapApi.Marker(bdPoint);
+        mapApi.addOverlay(m);
+        pathMarkers.push(m);
+        truncateEntryPath(closePointIndex);
+    }else{
+        originalPathBD.push(bdPoint);
+        var wgsDisp = mapApi.displayToWgs84(bdPoint.lng, bdPoint.lat);
+        originalPathLinear.push(d2l({lon:wgsDisp.lon, lat:wgsDisp.lat, alt:20}));
+        var m = mapApi.Marker(bdPoint);
+        mapApi.addOverlay(m);
+        pathMarkers.push(m);
+    }
+
+    drawFullPath();
+    markLastPoint();
+    notifyPathUpdate();
+}
+
+function connectPathEnds(){
+    if(originalPathLinear.length < 2){ return false; }
+    if(isPathClosed){ return true; }
+    originalPathCount = originalPathLinear.length;
+    var firstPoint = originalPathLinear[0];
+    var lastPoint = originalPathLinear[originalPathLinear.length - 1];
+    var firstWgs84 = l2d(firstPoint);
+    var lastWgs84 = l2d(lastPoint);
+    var distance = ll(lsub(lastPoint, firstPoint));
+    var numPoints = Math.max(3, Math.ceil(distance / 50));
+    var firstHeight = firstPoint.z;
+    var lastHeight = lastPoint.z;
+    for(var i = 1; i < numPoints; i++){
+        var t = i / numPoints;
+        var midLon = lastWgs84.lon + (firstWgs84.lon - lastWgs84.lon) * t;
+        var midLat = lastWgs84.lat + (firstWgs84.lat - lastWgs84.lat) * t;
+        var midHeight = lastHeight + (firstHeight - lastHeight) * t;
+        var midLinear = d2l({lon: midLon, lat: midLat, alt: midHeight});
+        var midDisplay = mapApi.wgs84ToDisplay(midLon, midLat);
+        var midPt = mapApi.Point(midDisplay.lng, midDisplay.lat);
+        originalPathBD.push(midPt);
+        originalPathLinear.push(midLinear);
+    }
+    originalPathBD.push(originalPathBD[0]);
+    originalPathLinear.push(firstPoint);
+    isPathClosed = true;
+    notifyPathUpdate();
+    return true;
+}
+
+function startPathFollowing(){
+    if(originalPathLinear.length === 0) return;
+    currentPathIndex = 0;
+    des = originalPathLinear[currentPathIndex];
+    var direction = lsub(des, pos);
+    var dist = ll(direction);
+    if(dist > 0.001){ vec = norm(direction); }
+    else { vec = {x:0,y:0,z:0}; }
+    pathFollowing = true;
+}
+
+function advancePathFollowing(){
+    currentPathIndex++;
+    if(typeof window._advDbg === 'undefined') window._advDbg = 0;
+    if(++window._advDbg % 10 === 0) {
+        qtLog("ADV idx=" + currentPathIndex + "/" + originalPathLinear.length +
+              " pF=" + pathFollowing + " cycle=" + cycleMode);
+    }
+    if(currentPathIndex >= originalPathLinear.length){
+        if(cycleMode){
+            currentPathIndex = 0;
+            des = originalPathLinear[currentPathIndex];
+            vec = norm(lsub(des, pos));
+            markLastPoint();
+            return;
+        } else {
+            pathFollowing = false;
+            pathCompleted = true;
+            return;
+        }
+    }
+    if(cycleMode && currentPathIndex === originalPathLinear.length - 1){
+        currentPathIndex = 0;
+        des = originalPathLinear[currentPathIndex];
+        vec = norm(lsub(des, pos));
+        markLastPoint();
+        return;
+    }
+    des = originalPathLinear[currentPathIndex];
+    var direction = lsub(des, pos);
+    var dist = ll(direction);
+    if(dist > 0.001) vec = norm(direction);
+    else vec = {x:0,y:0,z:0};
+    markLastPoint();
+}
+
+function pausePathFollowing(){ if(pathFollowing){ pausedPathFollowing = true; pathFollowing = false; qtSyncCpp(); } }
+function resumePathFollowing(){
+    if(pausedPathFollowing && originalPathLinear.length>0){
+        pausedPathFollowing = false;
+        pathFollowing = true;
+        des = originalPathLinear[currentPathIndex];
+        vec = norm(lsub(des, pos));
+        qtSyncCpp();
+    }
+}
+function qtStopPath(){
+    pathFollowing = false;
+    pausedPathFollowing = false;
+    qtSyncCpp();
+}
+function qtClearPath(){
+    delete window._jitState;
+    clearPath();
+}
+
+function qtTogglePathMode(){
+    pathMode = !pathMode;
+    if(!pathMode) clearPath();
+    return pathMode;
+}
+
+function notifyPathUpdate(){
+    console.log('PATH_UPDATE:' + currentMapMode + ':' + originalPathLinear.length);
+}
+
+function clearPath(){
+    if(window.pathPolyline){
+        mapApi.removeOverlay(window.pathPolyline);
+    }
+    pathMarkers.forEach(function(m){
+        mapApi.removeOverlay(m);
+    });
+    pathMarkers = [];
+    offroadLines.forEach(function(l){
+        mapApi.removeOverlay(l);
+    });
+    offroadLines = [];
+    originalPathBD = [];
+    originalPathLinear = [];
+    pathFollowing = false;
+    pausedPathFollowing = false;
+    pathCompleted = false;
+    cycleMode = false;
+    isPathClosed = false;
+    currentPathIndex = 0;
+    txtSpeeds = [];
+    txtTimestamps = [];
+    txtHeights = [];
+    useTxtSpeed = false;
+    originalPathCount = 0;
+    notifyPathUpdate();
+    qtSyncCpp();
+}
+
+function qtToggleCycle(){
+    cycleMode = !cycleMode;
+    if (!cycleMode) {
+        isPathClosed = false;
+        originalPathCount = 0;
+        offroadLines.forEach(function(l){ mapApi.removeOverlay(l); });
+        offroadLines = [];
+        drawFullPath();
+        markLastPoint();
+        return cycleMode;
+    }
+    if(originalPathLinear.length > 0){
+        if(!isPathClosed){
+            if(connectPathEnds()){
+                drawFullPath();
+                markLastPoint();
+            } else {
+                cycleMode = false;
+                return cycleMode;
+            }
+        }
+        drawFullPath();
+        markLastPoint();
+        if(!pathFollowing && originalPathLinear.length >= 2){
+            pathFollowing = true;
+            currentPathIndex = -1;
+            advancePathFollowing();
+        }
+    }
+    return cycleMode;
+}
+
+function qtSetInitialPos(){
+    return window.lat + "," + window.lon;
+}
+function qtSetInitPos(lat, lng){
+    window.lat = lat;
+    window.lon = lng;
+    window._jitBaseLat = lat;
+    window._jitBaseLon = lng;
+    if(_jitDrift){ _jitDrift.ox = 0; _jitDrift.oy = 0; _jitDrift.tx = 0; _jitDrift.ty = 0; }
+    var pos_d = d2l({lon:lng, lat:lat, alt:window.hgt});
+    pos = pos_d; des = pos_d; vec = {x:0,y:0,z:0};
+    var pt = mapApi.wgs84ToDisplay(lng, lat);
+    mainMarker.setPosition(pt);
+    mapApi.centerAndZoom(pt, 15);
+}
+function qtGetPosInfo(){
+    var info = "WGS84: " + window.lat.toFixed(6) + ", " + window.lon.toFixed(6);
+    info += "\n高度: " + window.hgt.toFixed(1) + " 米";
+    info += "\n速度: " + (currentSpeedKmH || 0).toFixed(1) + " km/h";
+    return info;
+}
+function qtGetPosForUDP(){ return window.lat.toFixed(7)+','+window.lon.toFixed(7)+','+window.hgt.toFixed(1); }
+function qtGetEffectivePos(){
+    if(window._previewLat !== null && window._previewLon !== null)
+        return window._previewLat.toFixed(7) + "," + window._previewLon.toFixed(7);
+    return window.lat.toFixed(7) + "," + window.lon.toFixed(7);
+}
+function qtIsStationary(){
+    return typeof currentSpeedKmH === "undefined" || currentSpeedKmH < 0.1 || pathFollowing === false;
+}
+var jitterOffsetLat = 0, jitterOffsetLon = 0;
+function qtSetJitterOffset(dlat, dlon){
+    jitterOffsetLat = dlat;
+    jitterOffsetLon = dlon;
+}
+function qtResetJitterOffset(){ jitterOffsetLat = 0; jitterOffsetLon = 0; }
+function qtSetJitterEnabled(on){ g_jitterEnabled = on; }
+
+var routePlanner = null;
+var routeStartMarker = null;
+var routeEndMarker = null;
+var routePolyline = null;
+var routePlanningMode = false;
+var routeClickState = 0;
+var routeEndPt = null;
+var routeStartPt = null;
+
+function qtEnablePathMode(){
+    currentMapMode = 'custom';
+    pathMode = true;
+    return true;
+}
+function qtUndoPathPoint(){
+    if(pathMarkers.length > 0){
+        var m = pathMarkers.pop();
+        mapApi.removeOverlay(m);
+        originalPathBD.pop();
+        originalPathLinear.pop();
+        drawFullPath();
+        return true;
+    }
+    return false;
+}
+
+function qtEnableMapClickRoute(){
+    routePlanningMode = true;
+    routeClickState = 0;
+    return "请在地图上点击目的地";
+}
+function qtResetMode(mode){
+    currentMapMode = mode || 'single';
+    routePlanningMode = false;
+    clearRouteUI();
+    pathMode = (mode === 'custom');
+    pathFollowing = false;
+    pausedPathFollowing = false;
+    cycleMode = false;
+    if(previewMarker){
+        mapApi.removeOverlay(previewMarker);
+        previewMarker = null;
+    }
+    window._previewLat = null; window._previewLon = null;
+    clearPath();
+}
+
+function qtEnableRouteClick(){
+    currentMapMode = 'route';
+    routePlanningMode = true;
+    routeClickState = 0;
+    if (typeof qtToast === 'function') {
+        qtToast("公路导航模式：请在地图上点击目的地", "info");
+    }
+}
+
+function qtPlanRouteToClick(lat, lon){
+    if (mapSource === "amap") {
+        var gcjFrom = coordtransform.wgs84togcj02(window.lon, window.lat);
+        var fromPt = mapApi.Point(gcjFrom[0], gcjFrom[1]);
+        var gcjTo = coordtransform.wgs84togcj02(lon, lat);
+        var toPt = mapApi.Point(gcjTo[0], gcjTo[1]);
+        clearPath();
+        clearRouteUI();
+        calculateRoute(fromPt, toPt);
+    } else if (mapSource === "tianditu") {
+        clearPath();
+        clearRouteUI();
+        calculateRouteTianditu(window.lon, window.lat, lon, lat);
+    } else {
+        if (typeof qtToast === 'function') qtToast("公路路径规划仅支持高德/天地图", "error");
+    }
+}
+function qtDisableMapClickRoute(){
+    routePlanningMode = false;
+    clearRouteUI();
+}
+function qtSearchSuggestion(name, lat, lng){
+    if(typeof qtPlanRouteToAddress === 'function'){
+        qtPlanRouteToAddress(name, lat, lng);
+    }
+}
+
+function qtToggleRouteMode(){
+    routePlanningMode = !routePlanningMode;
+    if(!routePlanningMode){
+        clearRouteUI();
+        return "公路规划已关闭";
+    }
+    routeClickState = 0;
+    return "请在地图上点击目的地";
+}
+
+function clearRouteUI(){
+    if(routeStartMarker) mapApi.removeOverlay(routeStartMarker);
+    if(routeEndMarker) mapApi.removeOverlay(routeEndMarker);
+    if(routePolyline) mapApi.removeOverlay(routePolyline);
+    routeStartMarker = null;
+    routeEndMarker = null;
+    routePolyline = null;
+    routeStartPt = null;
+    routeEndPt = null;
+    routeClickState = 0;
+    /* 一并清除预览标记 */
+    if(previewMarker){
+        mapApi.removeOverlay(previewMarker);
+        previewMarker = null;
+    }
+    window._previewLat = null; window._previewLon = null;
+}
+
+function calculateRoute(from, to){
+    if (mapSource !== "amap") return;
+    clearRouteUI();
+    if (typeof AMap.Driving !== 'function') {
+        qtLog('路线规划: AMap.Driving 未加载');
+        if (typeof qtToast === 'function') qtToast("路线规划插件加载中，请稍后再试", "warn");
+        return;
+    }
+    var driving = new AMap.Driving({
+        policy: AMap.DrivingPolicy.LEAST_DISTANCE
+    });
+    driving.search(from, to, function(status, result){
+        if (status === 'complete' && result.routes && result.routes.length) {
+            var route = result.routes[0];
+            var path = [];
+            route.steps.forEach(function(step){
+                step.path.forEach(function(p){
+                    path.push(p);
+                });
+            });
+            /* 调试第一点和最后一点的实际坐标 */
+            if (path.length > 1) {
+                var _p0 = path[0], _p1 = path[path.length-1];
+                qtLog("AMAP_PATH: " + _p0.lng.toFixed(6)+','+_p0.lat.toFixed(6) + " | " + _p1.lng.toFixed(6)+','+_p1.lat.toFixed(6));
+                /* 转换到 WGS84 看看 */
+                var _wgs0 = coordtransform.gcj02towgs84(_p0.lng, _p0.lat);
+                var _wgs1 = coordtransform.gcj02towgs84(_p1.lng, _p1.lat);
+                qtLog("AMAP_WGS84: " + _wgs0[0].toFixed(6)+','+_wgs0[1].toFixed(6) + " | " + _wgs1[0].toFixed(6)+','+_wgs1[1].toFixed(6));
+            }
+            routePolyline = new AMap.Polyline({path: path, strokeColor:"#3388ff", strokeWeight:4, strokeOpacity:0.8, geodesic:true});
+            mapApi.addOverlay(routePolyline);
+            var gcjPts = path.map(function(p){ return {lng: p.lng, lat: p.lat}; });
+            convertRouteToPath(gcjPts, to);
+            /* 等路线转换完成后，缩放至完整路径 */
+            if (originalPathBD.length > 0) {
+                mapApi.setViewport(originalPathBD);
+            }
+        } else {
+            qtLog('AMap route failed: ' + status + ' info=' + (result && result.info ? result.info : '') + ' result=' + JSON.stringify(result).substring(0,200));
+            if (typeof qtToast === 'function') qtToast("高德路线规划失败: " + (result && result.info ? result.info : status), "error");
+        }
+    });
+}
+
+function calculateRouteTianditu(fromLon, fromLat, toLon, toLat) {
+    qtLog('天地图路线规划: ' + fromLon.toFixed(6) + ',' + fromLat.toFixed(6) + ' -> ' + toLon.toFixed(6) + ',' + toLat.toFixed(6));
+    if (window._tdtServiceMap) {
+        /* 原生 T API */
+        try {
+            var drive = new T.DrivingRoute(window._tdtServiceMap, {
+                policy: T.DrivingPolicy.LEAST_TIME,
+                onSearchComplete: function(result) {
+                    if (result.getStatus() === 0) {
+                        try {
+                            var plan = result.getPlan(0);
+                            var route = plan.getRoute(0);
+                            var path = route.getPath();
+                            if (path && path.length > 1) {
+                                var routePts = [];
+                                for (var i = 0; i < path.length; i++) {
+                                    routePts.push({lng: path[i].lng, lat: path[i].lat});
+                                }
+                                qtLog('天地图原生API成功: ' + routePts.length + '个路线点');
+                                convertRouteToPath(routePts, {lng: toLon, lat: toLat});
+                                if (originalPathBD.length > 0) {
+                                    mapApi.setViewport(originalPathBD);
+                                }
+                                return;
+                            }
+                        } catch(e) {
+                            qtLog('天地图原生API解析错误: ' + e.message);
+                        }
+                    } else {
+                        qtLog('天地图原生API状态码: ' + result.getStatus());
+                    }
+                    /* 失败时回退到 REST API */
+                    qtLog('天地图原生API失败，回退到REST API');
+                    calculateRouteTiandituRest(fromLon, fromLat, toLon, toLat);
+                }
+            });
+            drive.search(new T.LngLat(fromLon, fromLat), new T.LngLat(toLon, toLat));
+            return;
+        } catch(e) {
+            qtLog('天地图原生API异常: ' + e.message + '，回退到REST API');
+        }
+    } else {
+        qtLog('天地图T.Map未初始化，使用REST API');
+    }
+    /* 回退：REST API */
+    calculateRouteTiandituRest(fromLon, fromLat, toLon, toLat);
+}
+
+function calculateRouteTiandituRest(fromLon, fromLat, toLon, toLat) {
+    var tk = window._mapApiKey;
+    qtLog('天地图REST Key: ' + (tk ? tk.substring(0, 8) + '...' : 'MISSING'));
+    if (!tk) {
+        if (typeof qtToast === 'function') qtToast("天地图 API Key 未设置", "error");
+        return;
+    }
+    var url = 'https://api.tianditu.gov.cn/drive?postStr=' + encodeURIComponent(JSON.stringify({orig:fromLon+","+fromLat, dest:toLon+","+toLat, style:"0"})) + '&type=search&tk=' + tk;
+    qtLog('天地图REST请求: ' + url);
+    /* 天地图 drive API 返回 XML 格式，需要用 $.get 获取原始文本再解析 */
+    $.get(url, function(data, status, xhr) {
+        var responseText = xhr.responseText;
+        qtLog('天地图REST响应长度: ' + responseText.length + ' 字符');
+        /* 解析 XML 响应，提取 routelatlon 字段 */
+        var routeStr = null;
+        var routelatlonMatch = responseText.match(/<routelatlon>([^<]*)<\/routelatlon>/);
+        if (routelatlonMatch && routelatlonMatch[1]) {
+            routeStr = routelatlonMatch[1];
+            qtLog('天地图REST提取routelatlon成功');
+        }
+        if (routeStr) {
+            var pairs = routeStr.split(';');
+            var routePts = [];
+            for (var i = 0; i < pairs.length; i++) {
+                var parts = pairs[i].split(',');
+                if (parts.length >= 2) {
+                    var rLon = parseFloat(parts[0]);
+                    var rLat = parseFloat(parts[1]);
+                    if (!isNaN(rLon) && !isNaN(rLat)) {
+                        routePts.push({lng: rLon, lat: rLat});
+                    }
+                }
+            }
+            if (routePts.length > 1) {
+                qtLog('天地图REST成功: ' + routePts.length + '个路线点');
+                convertRouteToPath(routePts, {lng: toLon, lat: toLat});
+                if (originalPathBD.length > 0) {
+                    mapApi.setViewport(originalPathBD);
+                }
+                return;
+            }
+        }
+        qtLog('天地图REST无有效路线数据');
+        fallbackStraightLine(fromLon, fromLat, toLon, toLat);
+    }).fail(function(xhr, status, err) {
+        qtLog('天地图REST请求失败: ' + status + ' ' + err);
+        fallbackStraightLine(fromLon, fromLat, toLon, toLat);
+    });
+}
+
+function fallbackStraightLine(fromLon, fromLat, toLon, toLat) {
+    if (typeof qtToast === 'function') qtToast("天地图路线规划失败，使用直线连接", "warn");
+    var fromDisplay = mapApi.wgs84ToDisplay(fromLon, fromLat);
+    var toDisplay = mapApi.wgs84ToDisplay(toLon, toLat);
+    var directLine = [{lng: fromDisplay.lng, lat: fromDisplay.lat}, {lng: toDisplay.lng, lat: toDisplay.lat}];
+    routePolyline = mapApi.Polyline(directLine, {strokeColor:"#ff6600", strokeWeight:3, strokeOpacity:0.7, strokeStyle:"dashed"});
+    mapApi.addOverlay(routePolyline);
+    convertRouteToPath([{lng: fromLon, lat: fromLat}, {lng: toLon, lat: toLat}], {lng: toDisplay.lng, lat: toDisplay.lat});
+}
+
+var pathConfirmed = false;
+function convertRouteToPath(pts, destPoint){
+    clearPath();
+    routeOriginalPts = [];
+    isRouteFromPlanning = false;
+    for(var i = 0; i < pts.length; i++){
+        var wgs84;
+        if (mapSource === "amap") {
+            /* 高德路线返回 GCJ-02，转回 WGS-84 存入 originalPathLinear（与 pos 坐标系一致） */
+            var w = coordtransform.gcj02towgs84(pts[i].lng, pts[i].lat);
+            wgs84 = { lon: w[0], lat: w[1] };
+            originalPathBD.push(mapApi.Point(pts[i].lng, pts[i].lat));
+        } else {
+            /* 天地图/其他：API返回的坐标直接使用 */
+            wgs84 = { lon: pts[i].lng, lat: pts[i].lat };
+            originalPathBD.push(mapApi.Point(pts[i].lng, pts[i].lat));
+        }
+        originalPathLinear.push(d2l({lon:wgs84.lon, lat:wgs84.lat, alt:20}));
+    }
+    if(destPoint && originalPathBD.length > 0){
+        var lastRoutePt = originalPathBD[originalPathBD.length - 1];
+        var dx = destPoint.lng - lastRoutePt.lng;
+        var dy = destPoint.lat - lastRoutePt.lat;
+        var distToDest = Math.sqrt(dx*dx + dy*dy) * 111320;
+        if(distToDest > 0.1){
+            var offroadLine = mapApi.Polyline([lastRoutePt, destPoint], {strokeColor:"#ff6600", strokeWeight:3, strokeOpacity:0.7, strokeStyle:"dashed"});
+            mapApi.addOverlay(offroadLine);
+            offroadLines.push(offroadLine);
+            var numExtra = Math.ceil(distToDest / 50);
+            for(var ei = 1; ei <= numExtra; ei++){
+                var t = ei / numExtra;
+                var midLon = lastRoutePt.lng + dx * t;
+                var midLat = lastRoutePt.lat + dy * t;
+                var wgsFromDisp = mapApi.displayToWgs84(midLon, midLat);
+                var midDisplay = mapApi.wgs84ToDisplay(wgsFromDisp.lon, wgsFromDisp.lat);
+                originalPathBD.push(midDisplay);
+                originalPathLinear.push(d2l({lon:wgsFromDisp.lon, lat:wgsFromDisp.lat, alt:20}));
+            }
+        }
+    }
+    var firstRoutePt = originalPathLinear[0];
+    var distFromStart = ll(lsub(firstRoutePt, pos));
+    if (distFromStart > 3.0) {
+        var fromWgs = l2d(pos);
+        var toWgs = l2d(firstRoutePt);
+        var dx = toWgs.lon - fromWgs.lon;
+        var dy = toWgs.lat - fromWgs.lat;
+        var distM = Math.sqrt(dx*dx + dy*dy) * 111320;
+        var numExtra = Math.max(1, Math.ceil(distM / 50));
+        var insert = [];
+        var insertBD = [];
+        for (var si = 0; si <= numExtra; si++) {
+            var t = si / numExtra;
+            var mlon = fromWgs.lon + dx * t;
+            var mlat = fromWgs.lat + dy * t;
+            insert.push(d2l({lon: mlon, lat: mlat, alt: 20}));
+            insertBD.push(mapApi.wgs84ToDisplay(mlon, mlat));
+        }
+        originalPathLinear = insert.concat(originalPathLinear);
+        originalPathBD = insertBD.concat(originalPathBD);
+    }
+    if(originalPathLinear.length >= 2){
+        pathConfirmed = false;
+        pathFollowing = false;
+        currentPathIndex = 0;
+        pos = originalPathLinear[0];
+        des = originalPathLinear[currentPathIndex];
+        _jitDrift = null;
+        window._jitBaseLat = window.lat;
+        window._jitBaseLon = window.lon;
+        var wgsNow = l2d(pos);
+        mainMarker.setPosition(mapApi.wgs84ToDisplay(wgsNow.lon, wgsNow.lat));
+        drawFullPath();
+        routeClickState = 0;
+        clearRouteUI();
+        notifyPathUpdate();
+    }
+}
+function qtConfirmMultiPath(){
+    pathConfirmed = true;
+    qtLog("qtConfirmMultiPath: linear=" + originalPathLinear.length + " pF=" + pathFollowing);
+    if(originalPathLinear.length >= 2 && !pathFollowing){
+        pathFollowing = true;
+        currentPathIndex = -1;
+        advancePathFollowing();
+    }
+    qtSyncCpp();
+}
+function qtStartTrack(){
+    qtLog("qtStartTrack: paused=" + pausedPathFollowing + " pF=" + pathFollowing +
+          " linear=" + originalPathLinear.length + " idx=" + currentPathIndex);
+    if(pausedPathFollowing && originalPathLinear.length > 0 && currentPathIndex < originalPathLinear.length){
+        pausedPathFollowing = false;
+        pathFollowing = true;
+        des = originalPathLinear[currentPathIndex];
+        var direction = lsub(des, pos);
+        vec = ll(direction) > 0.001 ? norm(direction) : {x:0,y:0,z:0};
+        qtSyncCpp();
+        return true;
+    }
+    if(originalPathLinear.length >= 2 && !pathFollowing){
+        pathFollowing = true;
+        currentPathIndex = -1;
+        advancePathFollowing();
+        qtSyncCpp();
+        return true;
+    }
+    return false;
+}
+function qtPauseTrack(){
+    pausedPathFollowing = true;
+    pathFollowing = false;
+    qtSyncCpp();
+}
+function qtStopTrack(){
+    clearPath();
+    pathFollowing = false;
+    pausedPathFollowing = false;
+    pathCompleted = false;
+}
+
+function qtPlanRoute(fromLat, fromLon, toLat, toLon){
+    if (mapSource === "amap") {
+        var gcjFrom = coordtransform.wgs84togcj02(fromLon, fromLat);
+        var fromPt = mapApi.Point(gcjFrom[0], gcjFrom[1]);
+        var gcjTo = coordtransform.wgs84togcj02(toLon, toLat);
+        var toPt = mapApi.Point(gcjTo[0], gcjTo[1]);
+        clearPath();
+        clearRouteUI();
+        calculateRoute(fromPt, toPt);
+    } else if (mapSource === "tianditu") {
+        clearPath();
+        clearRouteUI();
+        calculateRouteTianditu(fromLon, fromLat, toLon, toLat);
+    } else {
+        if (typeof qtToast === 'function') qtToast("公路路径规划仅支持高德/天地图", "error");
+    }
+}
+
+function qtPlanRouteToAddress(destAddr, fromLat, fromLon){
+    if(fromLat === undefined || fromLon === undefined){
+        fromLat = window.lat;
+        fromLon = window.lon;
+    }
+    if (mapSource === "amap") {
+        if (typeof AMap === 'undefined' || typeof AMap.PlaceSearch !== 'function') {
+            if (typeof qtToast === 'function') qtToast("高德搜索服务未加载", "error");
+            return;
+        }
+        var placeSearch = new AMap.PlaceSearch({});
+        placeSearch.search(destAddr, function(status, result){
+            if (status === 'complete' && result.poiList && result.poiList.pois && result.poiList.pois.length > 0) {
+                var poi = result.poiList.pois[0];
+                var toPt = mapApi.Point(poi.location.lng, poi.location.lat);
+                var gcjFrom = coordtransform.wgs84togcj02(fromLon, fromLat);
+                var fromPt = mapApi.Point(gcjFrom[0], gcjFrom[1]);
+                clearPath();
+                clearRouteUI();
+                calculateRoute(fromPt, toPt);
+            } else {
+                if (typeof qtToast === 'function') qtToast("高德未找到该地点", "error");
+            }
+        });
+    } else if (mapSource === "tianditu") {
+        var tk = window._mapApiKey;
+        var url = 'https://api.tianditu.gov.cn/search?postStr=' + encodeURIComponent(JSON.stringify({keyWord:destAddr,queryType:"1",start:"0",count:"1"})) + '&type=query&tk=' + tk;
+        $.getJSON(url, function(data) {
+            if (data && data.pois && data.pois.length > 0) {
+                var poi = data.pois[0];
+                var lonlat = poi.lonlat.split(',');
+                var toLon = parseFloat(lonlat[0]);
+                var toLat = parseFloat(lonlat[1]);
+                clearPath();
+                clearRouteUI();
+                calculateRouteTianditu(fromLon, fromLat, toLon, toLat);
+            } else {
+                if (typeof qtToast === 'function') qtToast("天地图未找到该地点", "error");
+            }
+        }).fail(function() {
+            if (typeof qtToast === 'function') qtToast("天地图搜索失败", "error");
+        });
+    } else {
+        if (typeof qtToast === 'function') qtToast("公路路径规划仅支持高德/天地图", "error");
+    }
+}
+
+function qtLoadTxt(content){
+    try {
+        if (!content || content.length === 0) return "文件内容为空";
+        content = content.replace(/^\uFEFF/, '');
+        var lines = content.split('\n');
+        var loaded = [];
+        var firstLine = '';
+
+        for(var i = 0; i < lines.length; i++){
+            var line = lines[i].replace('\r', '').trim();
+            if (firstLine === '' && line.length > 0) firstLine = line.substring(0, 40);
+            if(!line.startsWith('$GPGGA') && !line.startsWith('$GNGGA')) continue;
+            var parts = line.split(',');
+            if(parts.length < 6) continue;
+            var latStr = parts[2], latDir = parts[3], lonStr = parts[4], lonDir = parts[5];
+            if(!latStr || !lonStr || latStr === '' || lonStr === '') continue;
+            var latDeg = parseInt(latStr.substring(0,2));
+            var latMin = parseFloat(latStr.substring(2));
+            var lat = latDeg + latMin/60.0;
+            if(latDir === 'S') lat = -lat;
+            var lonDeg = parseInt(lonStr.substring(0,3));
+            var lonMin = parseFloat(lonStr.substring(3));
+            var lon = lonDeg + lonMin/60.0;
+            if(lonDir === 'W') lon = -lon;
+            if (isNaN(lat) || isNaN(lon)) continue;
+            var alt = 20;
+            if (parts.length > 9 && parts[9] !== '') { var a = parseFloat(parts[9]); if (!isNaN(a)) alt = a; }
+            loaded.push({lat:lat, lon:lon, alt:alt});
+        }
+
+        if (loaded.length === 0) {
+            var csvHeader = true;
+            for(var i = 0; i < lines.length; i++){
+                var line = lines[i].replace('\r', '').trim();
+                if (line.length === 0 || line.indexOf('统计') >= 0 || line.indexOf('轨迹') >= 0 || line.indexOf('总距') >= 0) continue;
+                var parts = line.split(',');
+                if (parts.length < 3) continue;
+                if (csvHeader) { csvHeader = false; continue; }
+                var lat = parseFloat(parts[parts.length >= 4 ? 2 : 0]);
+                var lon = parseFloat(parts[parts.length >= 4 ? 3 : 1]);
+                if (isNaN(lat) || isNaN(lon)) continue;
+                if (lat < -90 || lat > 90 || lon < -180 || lon > 180) continue;
+                var alt = 20;
+                loaded.push({lat:lat, lon:lon, alt:alt});
+            }
+        }
+
+        if(loaded.length === 0) return "未找到路径数据 (首行: " + firstLine + ")";
+        clearPath();
+        pathMode = true;
+        for(var i = 0; i < loaded.length; i++){
+            var pt = loaded[i];
+            var displayPt = mapApi.wgs84ToDisplay(pt.lon, pt.lat);
+            originalPathBD.push(displayPt);
+            originalPathLinear.push(d2l({lon:pt.lon, lat:pt.lat, alt:pt.alt}));
+            if (i === 0 || i === loaded.length - 1) {
+                var m = mapApi.Marker(displayPt);
+                mapApi.addOverlay(m);
+                pathMarkers.push(m);
+            }
+        }
+        drawFullPath();
+        markLastPoint();
+        if(originalPathLinear.length > 0){
+            var startPoint = originalPathLinear[0];
+            pos = startPoint; des = startPoint;
+            var wgs84 = l2d(startPoint);
+            window.lat = wgs84.lat; window.lon = wgs84.lon;
+            var ptCenter = mapApi.wgs84ToDisplay(window.lon, window.lat);
+            mainMarker.setPosition(ptCenter);
+            mapApi.centerAndZoom(ptCenter, 16);
+        }
+        setTimeout(function(){
+            if (originalPathBD.length >= 2) {
+                mapApi.setViewport(originalPathBD);
+            } else if (originalPathBD.length === 1) {
+                mapApi.centerAndZoom(originalPathBD[0], 15);
+            }
+        }, 200);
+        return "导入成功: " + loaded.length + " 个路径点";
+    } catch(e) { return "加载失败: " + e.message; }
+}
+
+var importedSpeedKmH = 0;
+var randomSpeedEnabled = false;
+var randomSpeedRange = 2;
+var randomLastUpdate = 0;
+var randomNextChange = 0;
+var randomCurrentOffset = 0;
+var randomTargetOffset = 0;
+var randomChangeState = 'stable';
+
+function qtToggleRandomSpeed() {
+    randomSpeedEnabled = !randomSpeedEnabled;
+    if (!randomSpeedEnabled) {
+        randomCurrentOffset = 0;
+        randomTargetOffset = 0;
+    }
+    return randomSpeedEnabled;
+}
+
+function qtSetRandomRange(val) {
+    randomSpeedRange = val;
+    if (val > 0) {
+        randomSpeedEnabled = true;
+        randomCurrentOffset = (Math.random() - 0.5) * 2 * randomSpeedRange;
+        randomTargetOffset = (Math.random() - 0.5) * 2 * randomSpeedRange;
+        randomNextChange = Date.now() + 1000 + Math.random() * 2000;
+        randomChangeState = 'changing';
+    } else {
+        randomSpeedEnabled = false;
+        randomCurrentOffset = 0;
+        randomTargetOffset = 0;
+    }
+}
+
+function getRandomSpeed(baseSpeed) {
+    if (!randomSpeedEnabled) return baseSpeed;
+    var now = Date.now();
+    if (randomNextChange === 0) randomNextChange = now + (1000 + Math.random() * 2000);
+    if (now >= randomNextChange) {
+        randomTargetOffset = (Math.random() - 0.5) * 2 * randomSpeedRange;
+        randomNextChange = now + (1000 + Math.random() * 2000);
+        randomChangeState = 'changing';
+    }
+    if (randomChangeState === 'changing') {
+        var dt = Math.min((now - randomLastUpdate) / 1000, 0.5);
+        var diff = randomTargetOffset - randomCurrentOffset;
+        var rate = Math.min(Math.abs(diff) / Math.max(randomNextChange - now, 500) * 1000, randomSpeedRange);
+        if (Math.abs(diff) < 0.05) {
+            randomCurrentOffset = randomTargetOffset;
+            randomChangeState = 'stable';
+        } else {
+            randomCurrentOffset += (diff > 0 ? 1 : -1) * Math.min(Math.abs(diff), rate * dt);
+        }
+    }
+    randomLastUpdate = now;
+    var finalSpeed = baseSpeed + randomCurrentOffset;
+    if (finalSpeed < 0) finalSpeed = 0;
+    return finalSpeed;
+}
+
+function qtExportPath() {
+    try {
+        if (originalPathLinear.length === 0) return "";
+        var exportData = {
+            version: '1.0',
+            type: 'web_path',
+            pathType: 'custom',
+            created: new Date().toISOString(),
+            points: originalPathLinear.map(function(p) {
+                var wgs84 = l2d(p);
+                return { lat: wgs84.lat, lon: wgs84.lon, alt: wgs84.alt || 20 };
+            }),
+            isPathClosed: isPathClosed,
+            originalPathCount: originalPathCount,
+            cycleMode: cycleMode
+        };
+        return JSON.stringify(exportData, null, 2);
+    } catch(e) { return ""; }
+}
+
+function qtExportRoute() {
+    try {
+        if (originalPathLinear.length === 0) return "";
+        var exportData = {
+            version: '1.0',
+            type: 'web_path',
+            pathType: 'route',
+            created: new Date().toISOString(),
+            points: originalPathLinear.map(function(p) {
+                var wgs84 = l2d(p);
+                return { lat: wgs84.lat, lon: wgs84.lon, alt: wgs84.alt || 20 };
+            }),
+            isPathClosed: isPathClosed,
+            originalPathCount: originalPathCount,
+            cycleMode: cycleMode
+        };
+        return JSON.stringify(exportData, null, 2);
+    } catch(e) { return ""; }
+}
+
+function qtImportPath(jsonStr) {
+    try {
+        jsonStr = jsonStr.replace(/^\uFEFF/, '');
+        var data = JSON.parse(jsonStr);
+        if (!data.type || data.type !== 'web_path' || !data.points || !Array.isArray(data.points))
+            return "无效的路径文件格式";
+        if (data.pathType === 'route') return "错误：该文件为公路模式路径，请在公路模式导入";
+        return doImportPath(data);
+    } catch(e) { return "导入失败: " + e.message; }
+}
+
+function qtImportRoute(jsonStr) {
+    try {
+        jsonStr = jsonStr.replace(/^\uFEFF/, '');
+        var data = JSON.parse(jsonStr);
+        if (!data.type || data.type !== 'web_path' || !data.points || !Array.isArray(data.points))
+            return "无效的路径文件格式";
+        if (data.pathType === 'custom') return "错误：该文件为自定义模式路径，请在自定义模式导入";
+        return doImportPath(data);
+    } catch(e) { return "导入失败: " + e.message; }
+}
+
+function doImportPath(data) {
+    try {
+        try { clearPath(); } catch(e) {}
+        for (var i = 0; i < data.points.length; i++) {
+            var pt = data.points[i];
+            if (pt.lat === undefined || pt.lon === undefined) continue;
+            var displayPt = mapApi.wgs84ToDisplay(pt.lon, pt.lat);
+            var alt = pt.alt !== undefined ? pt.alt : 20;
+            originalPathBD.push(displayPt);
+            originalPathLinear.push(d2l({lon: pt.lon, lat: pt.lat, alt: alt}));
+            if (i === 0 || i === data.points.length - 1) {
+                var m = mapApi.Marker(displayPt);
+                mapApi.addOverlay(m);
+                pathMarkers.push(m);
+            }
+        }
+        pathMode = true;
+        if (data.isPathClosed) {
+            isPathClosed = true;
+            originalPathCount = data.originalPathCount || originalPathLinear.length;
+        }
+        if (originalPathLinear.length < 2) isPathClosed = false;
+        drawFullPath();
+        markLastPoint();
+        if (data.cycleMode && originalPathLinear.length > 1) {
+            cycleMode = false;
+            if (!isPathClosed) connectPathEnds();
+            var minDist = Infinity, nearestIndex = 0;
+            for (var i = 0; i < originalPathLinear.length; i++) {
+                var dist = ll(lsub(originalPathLinear[i], pos));
+                if (dist < minDist) { minDist = dist; nearestIndex = i; }
+            }
+            currentPathIndex = nearestIndex;
+            des = originalPathLinear[(nearestIndex + 1) % originalPathLinear.length];
+            var direction = lsub(des, pos);
+            if (ll(direction) > 0.001) vec = norm(direction);
+            pathFollowing = true;
+            drawFullPath();
+            markLastPoint();
+        } else if (originalPathLinear.length > 1) {
+            startPathFollowing();
+        }
+        currentSpeedKmH = 0;
+        if (originalPathLinear.length > 0) {
+            pos = originalPathLinear[0];
+            des = pos;
+            var wgs84 = l2d(pos);
+            window.lat = wgs84.lat;
+            window.lon = wgs84.lon;
+            var ptCenter = mapApi.wgs84ToDisplay(window.lon, window.lat);
+            mainMarker.setPosition(ptCenter);
+            mapApi.centerAndZoom(ptCenter, 16);
+        }
+        setTimeout(function(){
+            if (originalPathBD.length >= 2) {
+                mapApi.setViewport(originalPathBD);
+            } else if (originalPathBD.length === 1) {
+                mapApi.centerAndZoom(originalPathBD[0], 15);
+            }
+        }, 200);
+        notifyPathUpdate();
+        return "导入成功: " + data.points.length + " 个路径点";
+    } catch(e) { return "导入失败: " + e.message; }
+}
+
+var moveTimer = null;
+var lastPostedLon = -999, lastPostedLat = -999;
+var postAccumDist = 0;
+var lastPostTime = 0;
+var effectiveSpeedKmH = 0;
+function post(){
+    var realMoved = 0;
+    if (typeof window._lastRealPos === 'undefined' || window._lastRealPos === null) {
+        window._lastRealPos = {x: pos.x, y: pos.y, z: pos.z};
+    } else {
+        realMoved = ll(lsub(pos, window._lastRealPos));
+        window._lastRealPos = {x: pos.x, y: pos.y, z: pos.z};
+    }
+    var realSpeedKmH = realMoved * 360;
+    var diff = targetSpeedKmH - currentSpeedKmH;
+    if (diff > accelPerTick) currentSpeedKmH += accelPerTick;
+    else if (diff < -accelPerTick) currentSpeedKmH -= accelPerTick;
+    else currentSpeedKmH = targetSpeedKmH;
+    effectiveSpeedKmH = getRandomSpeed(currentSpeedKmH);
+    if (randomSpeedEnabled) currentSpeedKmH = effectiveSpeedKmH;
+    /* 调试日志：每 2 秒输出一次速度 + 路径状态 */
+    if (typeof window._dbgTick === 'undefined') window._dbgTick = 0;
+    if (++window._dbgTick % 20 === 0) {
+        qtLog("POST: pF=" + pathFollowing + " pP=" + pausedPathFollowing +
+              " tgt=" + targetSpeedKmH.toFixed(1) + " cur=" + currentSpeedKmH.toFixed(1) +
+              " eff=" + effectiveSpeedKmH.toFixed(1) + " idx=" + currentPathIndex +
+              " len=" + originalPathLinear.length + " vec=" + (vec?vec.x.toFixed(3):"null"));
+    }
+    if(pathFollowing && effectiveSpeedKmH > 0){
+        /* 确保 mapApi.wgs84ToDisplay 已初始化，避免竞态崩溃 */
+        if (typeof mapApi.wgs84ToDisplay !== 'function') return;
+        var step = effectiveSpeedKmH / 36;
+        var remaining = step;
+        var maxIter = 20;
+        while (remaining > 0.01 && maxIter-- > 0) {
+            var d = lsub(des, pos);
+            var dist = ll(d);
+            if (dist < 0.1) {
+                advancePathFollowing();
+                d = lsub(des, pos);
+                dist = ll(d);
+                if (dist < 0.01) {
+                    /* 路径点过于密集（<1cm），直接吸附到当前点并跳过 */
+                    pos = {x: des.x, y: des.y, z: des.z};
+                    advancePathFollowing();
+                    d = lsub(des, pos);
+                    dist = ll(d);
+                    if (dist < 0.01) continue;
+                }
+            }
+            var move = remaining;
+            if (move > dist * 0.98) move = dist * 0.98;
+            vec = norm(d);
+            pos = ladd(pos, lmul(vec, move));
+            remaining -= move;
+        }
+        var wgs84 = l2d(pos);
+        var driftPos = applyJitterDrift(wgs84.lat, wgs84.lon, effectiveSpeedKmH);
+        window.lon = driftPos.lon;
+        window.lat = driftPos.lat;
+        delete window._jitState;
+        if (originalPathLinear.length >= 2 && originalPathBD.length >= 2) {
+            var dp = getDisplayPosition(pos, originalPathLinear, originalPathBD);
+            if (dp && !isNaN(dp.lon) && !isNaN(dp.lat) && dp.distMeters < 2.0) {
+                mainMarker.setPosition(mapApi.Point(dp.lon, dp.lat));
+            } else {
+                var pt = mapApi.wgs84ToDisplay(window.lon, window.lat);
+                mainMarker.setPosition(pt);
+            }
+        } else {
+            var pt = mapApi.wgs84ToDisplay(window.lon, window.lat);
+            mainMarker.setPosition(pt);
+        }
+    } else if (g_jitterEnabled && jitterRadiusMeters > 0 && typeof window.lat === 'number' && window.lat !== 0) {
+        var jb = l2d(pos);
+        var jp = applyJitterDrift(jb.lat, jb.lon, Math.max(realSpeedKmH, 4));
+        window.lat = jp.lat;
+        window.lon = jp.lon;
+        var pt = mapApi.wgs84ToDisplay(window.lon, window.lat);
+        mainMarker.setPosition(pt);
+    }
+    var now = Date.now();
+    var posChanged = Math.abs(window.lon - lastPostedLon) > 0.0000001 || Math.abs(window.lat - lastPostedLat) > 0.0000001;
+    if (posChanged) postAccumDist += effectiveSpeedKmH / 36;
+    if (postAccumDist >= 1.0 || now - lastPostTime >= 100) {
+    lastPostedLon = window.lon;
+    lastPostedLat = window.lat;
+    postAccumDist = 0;
+    lastPostTime = now;
+    }
+}
+if(moveTimer) clearInterval(moveTimer);
+moveTimer = setInterval(post, 100);
+
+var _jitDrift = null;
+function applyJitterDrift(baseLat, baseLon, speedKmH){
+    if(!g_jitterEnabled || jitterRadiusMeters <= 0 || speedKmH <= 0.1){
+        _jitDrift = null;
+        return {lat: baseLat, lon: baseLon};
+    }
+    if(!_jitDrift){
+        var a0 = Math.random()*2*Math.PI;
+        _jitDrift = {offLat:0, offLon:0, angle:a0, targetAngle:a0};
+    }
+    var jd = _jitDrift;
+    if(speedKmH > 60){
+        jd.offLat = 0; jd.offLon = 0;
+        return {lat: baseLat, lon: baseLon};
+    }
+    var cosLat = Math.cos(baseLat * Math.PI/180) || 0.0001;
+    var offMeters = Math.sqrt(jd.offLat*jd.offLat*111320.0*111320.0 + jd.offLon*jd.offLon*111320.0*cosLat*111320.0*cosLat);
+    if(offMeters > jitterRadiusMeters){
+        jd.targetAngle = Math.atan2(-jd.offLat, -jd.offLon*cosLat);
+    }
+    jd.targetAngle += (Math.random() - 0.5) * 2.0;
+    var diff = jd.targetAngle - jd.angle;
+    while(diff > Math.PI) diff -= 2*Math.PI;
+    while(diff < -Math.PI) diff += 2*Math.PI;
+    var maxTurn = 0.087;
+    if(diff > maxTurn) diff = maxTurn;
+    if(diff < -maxTurn) diff = -maxTurn;
+    jd.angle += diff;
+    var step = 10 / 36;
+    jd.offLat += step * Math.sin(jd.angle) / 111320.0;
+    jd.offLon += step * Math.cos(jd.angle) / (111320.0 * cosLat);
+    var offM2 = Math.sqrt(jd.offLat*jd.offLat*111320.0*111320.0 + jd.offLon*jd.offLon*111320.0*cosLat*111320.0*cosLat);
+    if(offM2 > jitterRadiusMeters){
+        var sc = jitterRadiusMeters / offM2;
+        jd.offLat *= sc;
+        jd.offLon *= sc;
+    }
+    return {lat: baseLat + jd.offLat, lon: baseLon + jd.offLon};
+}
+
+function qtToast(msg, type){
+    var existing = document.getElementById('qtToast');
+    if(existing) existing.remove();
+    var div = document.createElement('div');
+    div.id = 'qtToast';
+    var bg = '#22c55e';
+    if(type === 'error') bg = '#ef4444';
+    else if(type === 'warn') bg = '#f59e0b';
+    else if(type === 'info') bg = '#818cf8';
+    div.style.cssText = 'position:fixed;top:50px;left:50%;transform:translateX(-50%);z-index:9999;background:'+bg+';color:#fff;padding:8px 20px;border-radius:8px;font-size:13px;font-weight:bold;opacity:0;transition:opacity 0.3s;box-shadow:0 4px 12px rgba(0,0,0,0.3)';
+    div.textContent = msg;
+    document.body.appendChild(div);
+    setTimeout(function(){ div.style.opacity = '1'; }, 50);
+    setTimeout(function(){ div.style.opacity = '0'; setTimeout(function(){ div.remove(); }, 400); }, 2500);
+}
+
+</script>
+</body>
+</html>
