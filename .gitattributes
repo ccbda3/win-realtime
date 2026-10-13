@@ -1,0 +1,40 @@
+# 统一换行符为 LF（Windows 下 .bat/.cmd 除外）
+* text=auto
+
+# 源码 / 文本
+*.c        text
+*.h        text
+*.cpp      text
+*.hpp      text
+*.m        text
+*.py       text
+*.js       text
+*.css      text
+*.html     text
+*.json     text
+*.txt      text
+*.md       text
+*.iss      text
+*.rc       text
+*.service  text eol=lf
+Makefile   text eol=lf
+
+# Windows 脚本保持 CRLF
+*.bat      text eol=crlf
+*.cmd      text eol=crlf
+
+# 二进制
+*.ico      binary
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.exe      binary
+*.dll      binary
+*.lib      binary
+*.obj      binary
+*.pdb      binary
+
+# 语法高亮 / diff
+*.c        diff=c
+*.h        diff=c
+*.cpp      diff=cpp
