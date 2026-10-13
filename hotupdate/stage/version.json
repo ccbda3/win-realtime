@@ -1,0 +1,6 @@
+﻿{
+  "version": 36,
+  "files": [
+    {"path":"static/qtmap.html","size":0,"md5":"missing"}    {"path":"static/index.js","size":0,"md5":"missing"}    {"path":"static/jquery.js","size":0,"md5":"missing"}    {"path":"static/leaflet.js","size":0,"md5":"missing"}    {"path":"static/leaflet.css","size":0,"md5":"missing"}    {"path":"static/coordtransform.min.js","size":0,"md5":"missing"}    {"path":"gps-ui-qt.exe","size":0,"md5":"missing"}    {"path":"gps-core.exe","size":0,"md5":"missing"}
+  ]
+}
