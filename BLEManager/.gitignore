@@ -1,0 +1,12 @@
+*.o
+*.bin
+*.exe
+blegps
+blegps2
+gpsd
+gpssim
+pluto_tx
+webctrl
+__pycache__/
+*.pyc
+.DS_Store
