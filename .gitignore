@@ -1,0 +1,89 @@
+# ===== 编译输出 =====
+build/
+build_core/
+build_full/
+build_gaoduan/
+build_android/
+gps-ui-qt/gps-ui-qt/build/
+gps-ui-qt/gps-ui-qt/build_core/
+gps-ui-qt/build/
+gps-ui-qt/build_full/
+gps-ui-qt/build_hotupdate/
+gps-ui-qt/gps-ui-qt_portable/
+gaoduan/gps-ui-qt_portable/
+quanneng/gps-ui-qt_portable/
+license_gen/build/
+license_gen_android/build_android/
+
+# ===== 安装包输出 =====
+installer_output/
+
+# ===== 二进制 =====
+*.exe
+*.dll
+*.pdb
+*.exp
+*.lib
+*.obj
+*.ilk
+*.so
+*.a
+*.jar
+
+# ===== Qt / WebEngine 运行时资源 =====
+*.pak
+*.bin
+*.dat
+node_modules/
+
+# ===== 用户数据 / 配置 =====
+api_keys.json
+settings.ini
+*.log
+日志*.log
+
+# ===== 密钥凭证 (绝不提交) =====
+api.txt
+hotupdate/r2_credentials.h
+gen_c_arrays.py
+*.pem
+*.key
+*.lic
+
+# 授权码生成工具内含 RSA 私钥, 不公开
+license_gen/
+license_gen_android/
+
+# 内部规格文档
+*.docx
+
+# ===== 驱动安装包 =====
+PlutoSDR-M2k-USB-Drivers.exe
+
+# ===== IDE =====
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+CMakeUserPresets.json
+.DS_Store
+
+# ===== Python =====
+__pycache__/
+*.pyc
+
+# ===== 星历文件 =====
+*.26n
+*.27n
+*.28n
+*.29n
+*.30n
+*.31n
+*.32n
+*.33n
+手动星历/
+
+# ===== 测试/临时 =====
+q.txt
+ser.txt
