@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/logo.png" width="140" alt="行迹自录">
+  <img src="docs/images/logo.png" width="140" alt="行迹自录 · GPS 卫星">
 </p>
 
 <h1 align="center">行迹自录 · GPS 实时发射软件</h1>
